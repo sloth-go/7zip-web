@@ -152,10 +152,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          RUN_ID=$(gh run list --workflow=publish.yml --status=success \
-                     --limit 5 --json databaseId --jq '.[0].databaseId' || true)
+          # Pick the latest successful run that actually CARRIES a wasm-build
+          # artifact: skip_build runs reuse instead of upload, so the most
+          # recent success may itself have been a skip_build redeploy.
+          RUN_ID=""
+          for CAND in $(gh run list --workflow=publish.yml --status=success \
+                          --limit 10 --json databaseId --jq '.[].databaseId'); do
+            COUNT=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CAND/artifacts?name=wasm-build" \
+                      --jq '.total_count')
+            if [ "$COUNT" != "0" ]; then RUN_ID="$CAND"; break; fi
+          done
           if [ -z "$RUN_ID" ]; then
-            echo "::error::skip_build requested but no previous successful run of this workflow exists to reuse wasm from."
+            echo "::error::skip_build requested but no previous successful run with a wasm-build artifact exists to reuse."
             exit 1
           fi
           echo "Reusing wasm-build artifact from run $RUN_ID"

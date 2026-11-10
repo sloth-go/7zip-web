@@ -66,7 +66,7 @@ jobs:
 
       - name: Setup Emscripten
         if: ${{ !inputs.skip_build }}
-        uses: mymindstorm/setup-emsdk@v18
+        uses: mymindstorm/setup-emsdk@v16
         with:
           version: ${{ env.EM_VERSION }}
           actions-cache-folder: ${{ env.EM_CACHE_FOLDER }}

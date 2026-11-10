@@ -4,9 +4,11 @@
 // Usage: node generate-sw-manifest.mjs <site-dir>
 //
 // Node ESM, zero npm dependencies (Node >= 18). Fully deterministic: no Date,
-// no randomness — when build-info.json is absent the version is a sha256
-// content hash of every listed asset, so identical site bytes always produce
-// an identical manifest (and therefore an identical cache name).
+// no randomness — the version always ends in a sha256 content hash of every
+// listed asset, prefixed with "<version>-<builtAt>" from build-info.json when
+// present, so identical site bytes always produce an identical manifest (and
+// therefore an identical cache name) while ANY content change rotates it —
+// even a redeploy that reuses an old build-info.json.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -192,7 +194,13 @@ function main(argv) {
   assets.sort();
 
   const fromBuildInfo = buildInfoVersion(siteDir);
-  const version = fromBuildInfo ?? contentVersion(siteDir, assets.map((a) => a.slice(2)));
+  // The content hash is ALWAYS mixed in: a skip_build redeploy reuses the old
+  // build-info.json, so a "<version>-<builtAt>"-only stamp would pin a site
+  // whose bytes changed to a stale cache name — the updated service worker
+  // would overwrite the live cache in place during install instead of
+  // rotating cleanly to a new one.
+  const contentHash = contentVersion(siteDir, assets.map((a) => a.slice(2)));
+  const version = fromBuildInfo ? `${fromBuildInfo}-${contentHash}` : contentHash;
 
   // Exactly two statements, double-quoted JSON strings, no trailing comma in
   // the array so the literal is also valid JSON.

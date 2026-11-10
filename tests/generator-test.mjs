@@ -28,7 +28,22 @@ const BUILD_INFO = {
   builtAt: '2026-11-10T04:00:00Z',
   emscripten: '4.0.10',
 };
-const EXPECTED_VERSION = `${BUILD_INFO.version}-${BUILD_INFO.builtAt}`;
+const VERSION_PREFIX = `${BUILD_INFO.version}-${BUILD_INFO.builtAt}`;
+
+// build-info mode version: "<version>-<builtAt>-<12-hex content hash>" — the
+// hash suffix must rotate the cache name whenever site bytes change, even
+// when a redeploy reuses an unchanged build-info.json (skip_build).
+function assertBuildInfoVersion(v) {
+  assert.ok(
+    typeof v === 'string' && v.startsWith(VERSION_PREFIX + '-'),
+    `version ${v} should start with "${VERSION_PREFIX}-"`
+  );
+  assert.match(
+    v.slice(VERSION_PREFIX.length + 1),
+    /^[0-9a-f]{12}$/,
+    'build-info version must end with the 12-hex content hash'
+  );
+}
 
 // What the walk must produce for the fixture below, sorted.
 const EXPECTED_ASSETS = [
@@ -170,7 +185,7 @@ check('stdout is a single-line summary containing count + version', () => {
   const lines = runA.stdout.trim().split('\n');
   assert.equal(lines.length, 1, `expected one line, got: ${JSON.stringify(runA.stdout)}`);
   assert.match(lines[0], /\b9 assets\b/, 'summary should mention the asset count');
-  assert.ok(lines[0].includes(EXPECTED_VERSION), `summary should mention version: ${lines[0]}`);
+  assert.ok(lines[0].includes(VERSION_PREFIX), `summary should mention version: ${lines[0]}`);
   assert.equal(runA.stderr, '', 'a clean run must not write to stderr');
 });
 
@@ -242,8 +257,8 @@ check('every URL is relative (no root-absolute, no external origin)', () => {
   }
 });
 
-check('__SW_VERSION__ === "<version>-<builtAt>" from build-info.json', () => {
-  assert.equal(manA.version, EXPECTED_VERSION);
+check('__SW_VERSION__ === "<version>-<builtAt>-<contentHash>" from build-info.json', () => {
+  assertBuildInfoVersion(manA.version);
 });
 
 check('array literal is valid JSON (no trailing comma) and uses double quotes', () => {
@@ -252,12 +267,12 @@ check('array literal is valid JSON (no trailing comma) and uses double quotes', 
   assert.deepEqual(JSON.parse(m[1]), EXPECTED_ASSETS);
   const v = manA.code.match(/self\.__SW_VERSION__\s*=\s*("[^"]*");/);
   assert.ok(v, 'could not locate __SW_VERSION__ string literal');
-  assert.equal(JSON.parse(v[1]), EXPECTED_VERSION);
+  assert.equal(JSON.parse(v[1]), manA.version);
 });
 
 check('generated content is exactly the two documented statements', () => {
   const lines = manA.code.replace(/\n$/, '').split('\n');
-  assert.equal(lines[0], `self.__SW_VERSION__ = "${EXPECTED_VERSION}";`);
+  assert.equal(lines[0], `self.__SW_VERSION__ = "${manA.version}";`);
   assert.equal(lines[1], 'self.__SW_ASSETS__ = [');
   assert.equal(lines[lines.length - 1], '];');
   assert.equal(lines.length, 2 + EXPECTED_ASSETS.length + 1);
@@ -357,8 +372,24 @@ check('guaranteed entries survive a build-info.json version too', () => {
   const r = run();
   assert.equal(r.status, 0, r.stderr);
   const m = loadManifest();
-  assert.equal(m.version, EXPECTED_VERSION);
+  assertBuildInfoVersion(m.version);
   assert.ok(m.assets.includes('./index.html') && m.assets.includes('./offline.html'));
+});
+
+check('with build-info.json present, an asset byte change still rotates the version', () => {
+  // The skip_build redeploy regression: reusing an old build-info.json must
+  // NOT pin changed site bytes to the old cache name.
+  const before = loadManifest().version;
+  fs.appendFileSync(path.join(SITE, 'app.js'), '// bumped\n');
+  const r = run();
+  assert.equal(r.status, 0, r.stderr);
+  const after = loadManifest().version;
+  assert.notEqual(after, before, 'version must rotate when content changes, even with build-info');
+  assertBuildInfoVersion(after);
+  fs.writeFileSync(path.join(SITE, 'app.js'), '// app\nconsole.log("app");\n'); // restore
+  const r2 = run();
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.equal(loadManifest().version, before, 'version did not return after restore');
 });
 
 check('malformed build-info.json falls back to the content hash instead of crashing', () => {
@@ -407,7 +438,7 @@ check('works with a relative site dir (as CI invokes it) and a trailing slash', 
   const rel = run([`${path.relative(process.cwd(), SITE)}/`]);
   assert.equal(rel.status, 0, rel.stderr);
   const m = loadManifest();
-  assert.equal(m.version, EXPECTED_VERSION);
+  assertBuildInfoVersion(m.version);
   assert.deepEqual(m.assets, EXPECTED_ASSETS);
 });
 

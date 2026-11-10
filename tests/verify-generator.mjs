@@ -157,8 +157,11 @@ check('every emitted URL is relative ("./"-prefixed), none root-absolute or exte
   }
 });
 
-check('__SW_VERSION__ === "<version>-<builtAt>" from build-info.json', () => {
-  assertEq(m1.version, '26.06-2026-11-10T04:00:00Z');
+check('__SW_VERSION__ === "<version>-<builtAt>-<contentHash>" from build-info.json', () => {
+  // The content-hash suffix must ALWAYS be mixed in: a skip_build redeploy
+  // reuses this build-info.json while site bytes may have changed, so the
+  // prefix alone would pin new content to a stale cache name.
+  assertEq(m1.version, `26.06-2026-11-10T04:00:00Z-${sha12(COPY, m1.assets)}`);
 });
 
 check('output is exactly the two documented statements; array literal is valid JSON', () => {
@@ -319,8 +322,11 @@ check('build-info version containing quote + backslash is emitted as valid escap
     const r = runGen(BASE, ['site-copy']);
     assertEq(r.code, 0, 'exit code');
     const m = evalManifest(manifestPath);
-    assertEq(m.version, '1.0"x\\y-B', 'version round-trip');
-    assert(m.src.includes(JSON.stringify('1.0"x\\y-B')), 'raw output not properly escaped');
+    // build-info prefix + the always-mixed-in content hash (excluded assets
+    // like build-info.json itself never affect the hash).
+    const want = `1.0"x\\y-B-${sha12(COPY, m.assets)}`;
+    assertEq(m.version, want, 'version round-trip');
+    assert(m.src.includes(JSON.stringify(want)), 'raw output not properly escaped');
   } finally {
     fs.rmSync(path.join(COPY, 'build-info.json'));
     runGen(BASE, ['site-copy']);

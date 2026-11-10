@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="7-Zip WASM could not load this page because you are offline.">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#111111">
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" type="image/png" sizes="32x32" href="./icons/icon-32.png">
+<title>Offline — 7-Zip WASM</title>
+<style>
+  /* Palette mirrors index.html: dark by default, light on request. */
+  :root {
+    color-scheme: dark light;
+    --bg: #111111;
+    --card: #1c1f26;
+    --border: #2d323c;
+    --fg: #e9ebef;
+    --muted: #99a1b0;
+    --accent: #5b9dff;
+    --accent-strong: #7cb0ff;
+    --control-bg: #232833;
+    --control-border: #3a4150;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6f9;
+      --card: #ffffff;
+      --border: #d6dbe4;
+      --fg: #1b2029;
+      --muted: #5c6572;
+      --accent: #2563eb;
+      --accent-strong: #1e50c8;
+      --control-bg: #eaeef4;
+      --control-border: #c7cfdb;
+    }
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+  }
+  main {
+    width: 100%;
+    max-width: 34rem;
+    margin: 1.5rem;
+    padding: 2.25rem 1.75rem;
+    text-align: center;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+  }
+  svg { width: 68px; height: 68px; color: var(--muted); }
+  h1 { margin: .9rem 0 .4rem; font-size: 1.35rem; font-weight: 650; }
+  p { margin: 0 0 1.4rem; color: var(--muted); }
+  .actions { display: flex; gap: .65rem; justify-content: center; flex-wrap: wrap; }
+  button, a.btn {
+    font: inherit;
+    padding: .55rem 1.15rem;
+    border-radius: 9px;
+    border: 1px solid var(--control-border);
+    background: var(--control-bg);
+    color: var(--fg);
+    text-decoration: none;
+    cursor: pointer;
+  }
+  button:hover, a.btn:hover { border-color: var(--accent); color: var(--accent-strong); }
+  button:focus-visible, a.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+<main>
+  <svg viewBox="0 0 64 64" role="img" aria-label="Archive box" fill="none" stroke="currentColor"
+       stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M8 21 32 9l24 12v22L32 55 8 43z"/>
+    <path d="M8 21l24 12 24-12M32 33v22"/>
+    <path d="M20 15.5 44 27" opacity=".45"/>
+  </svg>
+  <h1>You are offline</h1>
+  <p>You are offline and this page was not cached.</p>
+  <div class="actions">
+    <button type="button" onclick="location.reload()">Retry</button>
+    <a class="btn" href="./index.html">Back to 7-Zip WASM</a>
+  </div>
+</main>
+</body>
+</html>

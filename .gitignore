@@ -1,0 +1,8 @@
+# Built artifacts (CI publishes fresh ones weekly; not committed)
+wasm/
+site-publish/
+
+# Local dev noise
+node_modules/
+*.log
+.DS_Store

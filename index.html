@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="7-Zip running entirely in your browser via WebAssembly — compress, extract and inspect archives offline, no uploads">
+  <meta name="theme-color" content="#111111">
+  <meta name="color-scheme" content="dark light">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="./icons/icon-32.png">
+  <link rel="apple-touch-icon" sizes="192x192" href="./icons/icon-192.png">
+  <title>7-Zip WASM — compress &amp; extract in your browser</title>
+  <style>
+    /* ---------- base ---------- */
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    .hidden { display: none !important; }
+
+    :root {
+      color-scheme: dark light;
+      --bg: #111111;
+      --bg-soft: #171a1f;
+      --card: #1c1f26;
+      --border: #2d323c;
+      --fg: #e9ebef;
+      --muted: #99a1b0;
+      --accent: #5b9dff;
+      --accent-strong: #7cb0ff;
+      --accent-soft: rgba(91, 157, 255, 0.12);
+      --accent-fg: #0c1322;
+      --error: #ff7a70;
+      --ok: #57d98a;
+      --console-bg: #0e1014;
+      --console-fg: #cdd6e4;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f4f6f9;
+        --bg-soft: #eaeef4;
+        --card: #ffffff;
+        --border: #d6dbe4;
+        --fg: #1b2029;
+        --muted: #5c6572;
+        --accent: #2563eb;
+        --accent-strong: #1e50c8;
+        --accent-soft: rgba(37, 99, 235, 0.08);
+        --accent-fg: #ffffff;
+        --error: #c53030;
+        --ok: #1c7c3f;
+        --console-bg: #10141b;
+        --console-fg: #d7dee9;
+        --shadow: 0 1px 2px rgba(16, 24, 40, 0.07);
+      }
+    }
+
+    html { -webkit-text-size-adjust: 100%; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.5;
+    }
+
+    ::selection { background: var(--accent); color: var(--accent-fg); }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    /* ---------- header ---------- */
+    .site-header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.6rem 0.75rem;
+      flex-wrap: wrap;
+      padding: 0.7rem 1.1rem;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+    }
+    .brand { display: flex; align-items: center; gap: 0.55rem; min-width: 0; }
+    .brand svg { color: var(--accent); flex: none; }
+    .brand h1 {
+      margin: 0;
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }
+    .brand h1 em { font-style: normal; color: var(--accent); }
+    .header-tools { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+    .header-tools .btn { padding: 0.35rem 0.85rem; font-size: 0.8rem; border-radius: 999px; }
+
+    #net-status,
+    .version-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.25rem 0.7rem;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--bg-soft);
+      color: var(--muted);
+      font-size: 0.78rem;
+      white-space: nowrap;
+    }
+    #net-status::before {
+      content: "";
+      flex: none;
+      width: 0.5rem;
+      height: 0.5rem;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+    #net-status.online::before { background: var(--ok); }
+    #net-status.offline::before { background: var(--error); }
+    #net-status.online { color: var(--fg); }
+
+    /* ---------- buttons ---------- */
+    .btn {
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.55rem 1.05rem;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--card);
+      color: var(--fg);
+      font: inherit;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      touch-action: manipulation;
+      transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn:active { transform: translateY(1px); }
+    .btn.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-fg);
+    }
+    .btn.primary:hover {
+      background: var(--accent-strong);
+      border-color: var(--accent-strong);
+      color: var(--accent-fg);
+    }
+
+    /* ---------- layout ---------- */
+    main {
+      flex: 1 0 auto;
+      width: 100%;
+      max-width: 60rem;
+      margin: 0 auto;
+      padding: 1.25rem 1rem 2rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+    .card {
+      margin: 0;
+      padding: 1.1rem 1.25rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+    }
+    h2 {
+      margin: 0 0 0.75rem;
+      font-size: 0.85rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .panel-head h2 { margin: 0; }
+    .panel-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+
+    /* ---------- dropzone ---------- */
+    #dropzone {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.55rem;
+      text-align: center;
+      padding: 3.25rem 1.5rem;
+      border: 2px dashed var(--border);
+      border-radius: 16px;
+      background: var(--bg-soft);
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    #dropzone:hover,
+    #dropzone:focus-visible,
+    #dropzone.dragover,
+    #dropzone.dragging,
+    #dropzone.drag-enter,
+    #dropzone.drag-over {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    #dropzone svg { color: var(--accent); flex: none; }
+    .dz-title { margin: 0; font-size: 1.15rem; font-weight: 700; text-wrap: balance; }
+    .dz-sub { margin: 0; max-width: 36rem; color: var(--muted); font-size: 0.9rem; text-wrap: pretty; }
+
+    /* ---------- status + output ---------- */
+    #status-line {
+      margin: 0;
+      min-height: 1.4em;
+      font-size: 0.95rem;
+      font-weight: 500;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+    #status-line:empty { display: none; }
+    #status-line.error { color: var(--error); font-weight: 600; }
+
+    #progress-output {
+      margin: 0;
+      padding: 0.8rem 0.95rem;
+      min-height: 5.5rem;
+      max-height: 15rem;
+      overflow: auto;
+      background: var(--console-bg);
+      color: var(--console-fg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 0.8rem;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+      tab-size: 4;
+    }
+
+    /* ---------- archive panel ---------- */
+    #archive-name {
+      text-transform: none;
+      letter-spacing: 0;
+      font-size: 1rem;
+      color: var(--fg);
+      overflow-wrap: anywhere;
+    }
+    .table-wrap {
+      margin-top: 0.9rem;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    table {
+      width: 100%;
+      min-width: 36rem;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+    }
+    thead th {
+      padding: 0.55rem 0.75rem;
+      text-align: left;
+      background: var(--bg-soft);
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      white-space: nowrap;
+      border-bottom: 1px solid var(--border);
+    }
+    tbody td {
+      padding: 0.5rem 0.75rem;
+      border-bottom: 1px solid var(--border);
+      overflow-wrap: anywhere;
+      vertical-align: top;
+    }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr:hover td { background: var(--bg-soft); }
+    tbody tr.folder td:first-child { font-weight: 600; }
+    tbody tr.folder td:first-child::before { content: '🗀 '; }
+    th:nth-child(2), td:nth-child(2) { text-align: right; font-variant-numeric: tabular-nums; }
+
+    /* ---------- compress panel ---------- */
+    #compress-list {
+      margin: 0.75rem 0 0;
+      padding: 0;
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+    }
+    #compress-list li {
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.45rem 0.25rem;
+      border-bottom: 1px dashed var(--border);
+      font-size: 0.9rem;
+      overflow-wrap: anywhere;
+    }
+    #compress-list li:last-child { border-bottom: none; }
+
+    .compress-controls {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+      gap: 0.75rem;
+      margin-top: 0.9rem;
+      align-items: end;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+    .field select,
+    .field input {
+      width: 100%;
+      padding: 0.55rem 0.7rem;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--bg-soft);
+      color: var(--fg);
+      font: inherit;
+      font-size: 0.92rem;
+      font-weight: 500;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .field select:focus,
+    .field input:focus { border-color: var(--accent); outline-offset: 1px; }
+
+    /* ---------- downloads ---------- */
+    #downloads { display: flex; flex-direction: column; gap: 0.6rem; }
+    #downloads:empty { display: none; }
+    #downloads a {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.75rem 1rem;
+      background: var(--card);
+      border: 1px solid var(--accent);
+      border-radius: 12px;
+      color: var(--accent);
+      font-weight: 600;
+      text-decoration: none;
+      overflow-wrap: anywhere;
+      box-shadow: var(--shadow);
+    }
+    #downloads a:hover { background: var(--accent-soft); }
+
+    /* ---------- noscript + footer ---------- */
+    .noscript-banner {
+      max-width: 60rem;
+      margin: 1rem auto 0;
+      padding: 0.9rem 1.25rem;
+      background: var(--card);
+      border: 1px solid var(--error);
+      border-radius: 12px;
+      color: var(--fg);
+      font-size: 0.95rem;
+    }
+    .site-footer {
+      flex-shrink: 0;
+      padding: 1.25rem 1rem 1.75rem;
+      border-top: 1px solid var(--border);
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+    .site-footer p { margin: 0 auto; max-width: 46rem; }
+
+    /* ---------- small screens ---------- */
+    @media (max-width: 40rem) {
+      .site-header { padding: 0.6rem 0.85rem; }
+      main { padding: 1rem 0.75rem 1.5rem; }
+      .card { padding: 0.9rem; }
+      #dropzone { padding: 2.5rem 1rem; }
+      .dz-title { font-size: 1.02rem; }
+      .panel-head { flex-direction: column; align-items: stretch; }
+      .panel-actions .btn { flex: 1 1 auto; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        transition: none !important;
+        animation: none !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <noscript>
+    <div class="noscript-banner">
+      <strong>JavaScript is disabled.</strong>
+      7-Zip WASM runs the 7-Zip engine entirely inside your browser using JavaScript and WebAssembly.
+      Please enable JavaScript to compress, extract and inspect archives — your files are never uploaded.
+    </div>
+  </noscript>
+
+  <header class="site-header">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+        <path d="M21 8v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8"/>
+        <rect x="2" y="3.5" width="20" height="4.5" rx="1"/>
+        <path d="M10 12.5h4"/>
+      </svg>
+      <h1>7-Zip <em>WASM</em></h1>
+    </div>
+    <div class="header-tools">
+      <span id="net-status" role="status" aria-label="Network status"></span>
+      <span class="version-pill"><span id="build-version">local</span></span>
+      <button id="install-btn" type="button" class="btn primary" hidden>Install app</button>
+      <button id="btn-clear" type="button" class="btn">Clear</button>
+    </div>
+  </header>
+
+  <main>
+    <section aria-label="File drop zone">
+      <div id="dropzone" role="button" tabindex="0" aria-label="Drop an archive to inspect or extract, or drop files to compress. Activates a file chooser.">
+        <svg viewBox="0 0 24 24" width="52" height="52" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <path d="M21 8v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8"/>
+          <rect x="2" y="3.5" width="20" height="4.5" rx="1"/>
+          <path d="M10 12.5h4"/>
+        </svg>
+        <p class="dz-title">Drop an archive to inspect/extract, or drop files to compress</p>
+        <p class="dz-sub">…or click anywhere in this box to browse. 7-Zip runs locally via WebAssembly — your files never leave your device.</p>
+      </div>
+      <input id="file-input" type="file" multiple hidden>
+    </section>
+
+    <p id="status-line" role="status" aria-live="polite"></p>
+
+    <section class="card" aria-label="7-Zip output">
+      <h2>Output</h2>
+      <pre id="progress-output" role="log" aria-live="polite" aria-relevant="additions" spellcheck="false"></pre>
+    </section>
+
+    <section id="archive-panel" class="card" hidden>
+      <div class="panel-head">
+        <h2>Archive: <span id="archive-name"></span></h2>
+        <div class="panel-actions">
+          <button id="btn-extract-all" type="button" class="btn primary">Extract all</button>
+          <button id="btn-test-archive" type="button" class="btn">Test archive</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Name</th>
+              <th scope="col">Size</th>
+              <th scope="col">Modified</th>
+              <th scope="col">Method</th>
+            </tr>
+          </thead>
+          <tbody id="entries-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="compress-panel" class="card" hidden>
+      <div class="panel-head">
+        <h2>Compress files</h2>
+        <button id="btn-compress" type="button" class="btn primary">Compress</button>
+      </div>
+      <ul id="compress-list"></ul>
+      <div class="compress-controls">
+        <label class="field">
+          <span>Format</span>
+          <select id="format-select">
+            <option value="7z" selected>7z</option>
+            <option value="zip">zip</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Level</span>
+          <select id="level-select">
+            <option value="0">0</option>
+            <option value="1">1</option>
+            <option value="3">3</option>
+            <option value="5" selected>5</option>
+            <option value="7">7</option>
+            <option value="9">9</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input id="password-input" type="password" placeholder="Optional — encrypts the archive" autocomplete="off">
+        </label>
+      </div>
+    </section>
+
+    <div id="downloads" aria-live="polite"></div>
+  </main>
+
+  <footer class="site-footer">
+    <p>7-Zip is (c) 1999-2026 Igor Pavlov. This site runs it entirely in your browser via WebAssembly — your files never leave your device.</p>
+  </footer>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>

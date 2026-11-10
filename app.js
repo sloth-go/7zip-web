@@ -1,0 +1,693 @@
+/*
+ * app.js — UI glue for the 7-Zip WASM PWA (classic script, loaded with defer).
+ *
+ * Owns the sequential request queue towards worker.js (the wasm engine is
+ * single-threaded: exactly one job in flight at a time), file intake via
+ * #dropzone / #file-input, the archive and compress panels, streamed progress,
+ * downloads, install prompt, online/offline pill and build-info version pill.
+ *
+ * Every URL is RELATIVE — the site must work from any subpath and offline.
+ */
+(function () {
+  'use strict';
+
+  var ARCHIVE_EXTS = [
+    '7z', 'zip', 'rar', 'tar', 'gz', 'tgz', 'bz2', 'tbz', 'xz', 'txz',
+    'zst', 'tzst', 'iso', 'cab', 'lzma', 'lzh', 'arj',
+  ];
+  var MAX_PROGRESS_LINES = 200;
+
+  // ----------------------------------------------------------------- state ---
+  var worker = null;
+  var workerReadyPromise = null; // resolves once {type:'ready'} for init arrived
+  var workerReadyResolve = null;
+  var workerReadyReject = null;
+  var initMessageId = 0;
+  var nextId = 1;
+  var pending = new Map(); // id -> { requestType, resolve, reject }
+  var queue = []; // serialized outbound requests
+  var busy = false;
+
+  var queuedFiles = []; // { path, name, size, data: ArrayBuffer } for compress
+  var currentArchive = null; // { name, data: ArrayBuffer } currently opened
+  var objectUrls = []; // kept alive until Clear
+  var progressLines = [];
+  var deferredInstallPrompt = null;
+  // Bumped by Clear: operation callbacks capture the generation at dispatch
+  // time and become no-ops when it changes, so results of jobs that were
+  // cleared mid-flight never touch the reset UI.
+  var generation = 0;
+  var staleProgressIds = new Set(); // ids whose progress lines Clear muted
+
+  // ------------------------------------------------------------------- dom ---
+  var dropzone, fileInput, statusLine, progressOutput;
+  var archivePanel, archiveNameEl, entriesBody, btnExtractAll, btnTestArchive;
+  var compressPanel, compressList, formatSelect, levelSelect, passwordInput, btnCompress;
+  var downloadsEl, installBtn, netStatus, buildVersion, btnClear;
+  var initialStatusText = '';
+
+  function $(id) {
+    return document.getElementById(id);
+  }
+
+  // --------------------------------------------------------------- helpers ---
+
+  function setStatus(text, isError) {
+    statusLine.textContent = text === null || text === undefined ? '' : String(text);
+    if (isError) statusLine.classList.add('error');
+    else statusLine.classList.remove('error');
+  }
+
+  function humanSize(n) {
+    if (typeof n !== 'number' || isNaN(n)) return '';
+    if (n < 1024) return n + ' B';
+    var units = ['KiB', 'MiB', 'GiB', 'TiB'];
+    var v = n;
+    var u = -1;
+    do {
+      v /= 1024;
+      u++;
+    } while (v >= 1024 && u < units.length - 1);
+    return (v >= 100 ? Math.round(v) : v.toFixed(1)) + ' ' + units[u];
+  }
+
+  function baseName(p) {
+    var s = String(p || '').replace(/\\/g, '/');
+    var i = s.lastIndexOf('/');
+    return i >= 0 ? s.slice(i + 1) : s;
+  }
+
+  function extOf(name) {
+    var s = String(name || '').toLowerCase();
+    var i = s.lastIndexOf('.');
+    return i >= 0 && i < s.length - 1 ? s.slice(i + 1) : '';
+  }
+
+  function isArchiveName(name) {
+    return ARCHIVE_EXTS.indexOf(extOf(name)) >= 0;
+  }
+
+  // Exact-sized detached copy so the local ArrayBuffer stays usable after
+  // the original is handed to the worker in a transfer list.
+  function transferCopy(buf) {
+    return buf.slice(0);
+  }
+
+  function currentPassword() {
+    var pw = passwordInput && passwordInput.value;
+    return typeof pw === 'string' && pw !== '' ? pw : undefined;
+  }
+
+  // ------------------------------------------------------- worker plumbing ---
+
+  function ensureWorker() {
+    if (workerReadyPromise) return workerReadyPromise;
+    worker = new Worker('./worker.js');
+    worker.onmessage = onWorkerMessage;
+    worker.onerror = onWorkerError;
+    workerReadyPromise = new Promise(function (resolve, reject) {
+      workerReadyResolve = resolve;
+      workerReadyReject = reject;
+    });
+    // Init is the very first message; the worker replies {id, type:'ready'}.
+    initMessageId = nextId++;
+    pending.set(initMessageId, {
+      requestType: 'init',
+      resolve: function () {},
+      reject: function () {},
+    });
+    worker.postMessage({ id: initMessageId, type: 'init' });
+    return workerReadyPromise;
+  }
+
+  function onWorkerError(ev) {
+    var message =
+      (ev && ev.message ? 'Worker error: ' + ev.message : 'The 7-Zip worker failed to start.') +
+      ' (Check that wasm/7zz.js and wasm/7zz.wasm are present.)';
+    console.error('[7zip-web] worker error', ev);
+    setStatus(message, true);
+    failEverything(new Error(message));
+  }
+
+  function failEverything(err) {
+    if (workerReadyReject) {
+      workerReadyReject(err);
+      workerReadyResolve = null;
+      workerReadyReject = null;
+    }
+    workerReadyPromise = null; // allow a fresh Worker on the next operation
+    if (worker) {
+      worker.terminate();
+      worker = null;
+    }
+    pending.forEach(function (entry) {
+      entry.reject(err);
+    });
+    pending.clear();
+    busy = false;
+    pumpQueue();
+  }
+
+  function onWorkerMessage(ev) {
+    var msg = ev && ev.data;
+    if (!msg || typeof msg !== 'object') return;
+
+    if (msg.type === 'progress') {
+      if (staleProgressIds.has(msg.id)) return;
+      appendProgressLine(msg.line);
+      return;
+    }
+
+    if (msg.type === 'ready') {
+      // 'ready' belongs to the init handshake; ignore stray ones (the worker
+      // also announces readiness on an implicit first-message init).
+      if (workerReadyResolve) {
+        workerReadyResolve();
+        workerReadyResolve = null;
+        workerReadyReject = null;
+      }
+      var initEntry = pending.get(msg.id);
+      if (initEntry && initEntry.requestType === 'init') pending.delete(msg.id);
+      return;
+    }
+
+    var entry = pending.get(msg.id);
+    if (!entry) {
+      staleProgressIds.delete(msg.id); // cleared job finished — stop muting
+      return;
+    }
+
+    if (msg.type === 'error') {
+      pending.delete(msg.id);
+      if (entry.requestType === 'init') {
+        failEverything(new Error(msg.message || 'Worker initialization failed'));
+        return;
+      }
+      entry.reject(new Error(msg.message || 'The 7-Zip worker reported an error'));
+      finishCurrentRequest();
+      return;
+    }
+
+    if (
+      msg.type === 'list-result' ||
+      msg.type === 'extract-result' ||
+      msg.type === 'compress-result' ||
+      msg.type === 'test-result'
+    ) {
+      pending.delete(msg.id);
+      entry.resolve(msg);
+      finishCurrentRequest();
+    }
+  }
+
+  function finishCurrentRequest() {
+    busy = false;
+    pumpQueue();
+  }
+
+  // Sequential queue: only one request is in flight; the next one is
+  // dispatched after the previous completes (success or failure).
+  function sendRequest(requestType, payload) {
+    return new Promise(function (resolve, reject) {
+      queue.push({ requestType: requestType, payload: payload, resolve: resolve, reject: reject });
+      pumpQueue();
+    });
+  }
+
+  function pumpQueue() {
+    if (busy || queue.length === 0) return;
+    var item = queue.shift();
+    busy = true;
+    ensureWorker().then(
+      function () {
+        var id = nextId++;
+        var msg = { id: id, type: item.requestType };
+        var transfers = [];
+        Object.keys(item.payload).forEach(function (key) {
+          msg[key] = item.payload[key];
+        });
+        // Binary payloads travel as ArrayBuffers in the transfer list.
+        if (msg.archive && msg.archive.data) {
+          msg.archive = { name: msg.archive.name, data: transferCopy(msg.archive.data) };
+          transfers.push(msg.archive.data);
+        }
+        if (Array.isArray(msg.files)) {
+          msg.files = msg.files.map(function (f) {
+            var copy = transferCopy(f.data);
+            transfers.push(copy);
+            return { path: f.path, data: copy };
+          });
+        }
+        pending.set(id, {
+          requestType: item.requestType,
+          resolve: item.resolve,
+          reject: item.reject,
+        });
+        try {
+          worker.postMessage(msg, transfers);
+        } catch (e) {
+          pending.delete(id);
+          item.reject(e);
+          finishCurrentRequest();
+        }
+      },
+      function (err) {
+        item.reject(err);
+        finishCurrentRequest();
+      }
+    );
+  }
+
+  // ----------------------------------------------------- progress + status ---
+
+  function appendProgressLine(line) {
+    progressLines.push(String(line === undefined || line === null ? '' : line));
+    while (progressLines.length > MAX_PROGRESS_LINES) progressLines.shift();
+    progressOutput.textContent = progressLines.join('\n');
+    progressOutput.scrollTop = progressOutput.scrollHeight; // autoscroll
+  }
+
+  // ------------------------------------------------------------ file intake ---
+
+  function handleIncomingFiles(fileList) {
+    var files = Array.prototype.slice.call(fileList || []);
+    if (!files.length) return;
+    var firstArchive = null;
+    var toQueue = [];
+    files.forEach(function (file) {
+      if (!firstArchive && isArchiveName(file.name)) firstArchive = file;
+      else toQueue.push(file);
+    });
+    if (firstArchive) openArchive(firstArchive);
+    if (toQueue.length) queueFilesForCompress(toQueue);
+  }
+
+  function openArchive(file) {
+    var gen = generation;
+    setStatus('Reading "' + file.name + '"…');
+    file
+      .arrayBuffer()
+      .then(function (data) {
+        if (gen !== generation) return null;
+        currentArchive = { name: file.name, data: data };
+        archiveNameEl.textContent = file.name;
+        archivePanel.hidden = false;
+        // Mixed drop: an archive opens while other files queue for compress —
+        // keep the compress panel visible when the queue is not empty.
+        compressPanel.hidden = queuedFiles.length === 0;
+        return sendRequest('list', {
+          archive: { name: currentArchive.name, data: currentArchive.data },
+          password: currentPassword(),
+        });
+      })
+      .then(function (res) {
+        if (gen !== generation || !res) return;
+        renderEntries(res.entries || []);
+        setStatus(
+          '"' + currentArchive.name + '": ' + (res.entries || []).length + ' entries listed'
+        );
+      })
+      .catch(function (err) {
+        if (gen !== generation) return;
+        renderEntries([]);
+        setStatus(err && err.message ? err.message : String(err), true);
+      });
+  }
+
+  function renderEntries(entries) {
+    entriesBody.textContent = '';
+    var frag = document.createDocumentFragment();
+    entries.forEach(function (entry) {
+      var tr = document.createElement('tr');
+      if (entry.isFolder) tr.className = 'folder';
+
+      var tdName = document.createElement('td');
+      tdName.textContent = entry.isFolder ? entry.path + '/' : entry.path;
+      if (entry.encrypted) tdName.title = 'Encrypted';
+
+      var tdSize = document.createElement('td');
+      tdSize.textContent = entry.isFolder ? '—' : humanSize(entry.size);
+
+      var tdModified = document.createElement('td');
+      tdModified.textContent = entry.modified || '';
+
+      var tdMethod = document.createElement('td');
+      tdMethod.textContent = entry.method || '';
+
+      tr.appendChild(tdName);
+      tr.appendChild(tdSize);
+      tr.appendChild(tdModified);
+      tr.appendChild(tdMethod);
+      frag.appendChild(tr);
+    });
+    if (!entries.length) {
+      var trEmpty = document.createElement('tr');
+      var tdEmpty = document.createElement('td');
+      tdEmpty.colSpan = 4;
+      tdEmpty.textContent = '(no entries)';
+      trEmpty.appendChild(tdEmpty);
+      frag.appendChild(trEmpty);
+    }
+    entriesBody.appendChild(frag);
+  }
+
+  function queueFilesForCompress(files) {
+    setStatus('Reading ' + files.length + ' file' + (files.length > 1 ? 's' : '') + '…');
+    Promise.all(
+      files.map(function (file) {
+        return file.arrayBuffer().then(function (data) {
+          return {
+            path: file.webkitRelativePath || file.name,
+            name: file.name,
+            size: data.byteLength,
+            data: data,
+          };
+        });
+      })
+    ).then(
+      function (items) {
+        queuedFiles = queuedFiles.concat(items);
+        renderCompressList();
+        setStatus(
+          queuedFiles.length +
+            ' file' +
+            (queuedFiles.length > 1 ? 's' : '') +
+            ' queued for compression'
+        );
+      },
+      function (err) {
+        setStatus(err && err.message ? err.message : String(err), true);
+      }
+    );
+  }
+
+  function renderCompressList() {
+    compressList.textContent = '';
+    var frag = document.createDocumentFragment();
+    queuedFiles.forEach(function (item, index) {
+      var li = document.createElement('li');
+
+      var label = document.createElement('span');
+      label.textContent = item.path + ' — ' + humanSize(item.size);
+
+      var removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'btn';
+      removeBtn.textContent = 'Remove';
+      removeBtn.setAttribute('aria-label', 'Remove ' + item.name + ' from the list');
+      removeBtn.addEventListener('click', function () {
+        queuedFiles.splice(index, 1);
+        renderCompressList();
+      });
+
+      li.appendChild(label);
+      li.appendChild(removeBtn);
+      frag.appendChild(li);
+    });
+    compressList.appendChild(frag);
+    compressPanel.hidden = queuedFiles.length === 0;
+  }
+
+  // -------------------------------------------------------------- downloads ---
+
+  function addDownload(name, buffer) {
+    var blob = new Blob([buffer]);
+    var url = URL.createObjectURL(blob);
+    objectUrls.push(url); // kept alive until Clear revokes them
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = baseName(name);
+    var label = document.createElement('span');
+    label.textContent = a.download;
+    var size = document.createElement('span');
+    size.textContent = humanSize(buffer.byteLength);
+    a.appendChild(label);
+    a.appendChild(size);
+    downloadsEl.appendChild(a);
+  }
+
+  // ------------------------------------------------------------ operations ---
+
+  function onTestArchive() {
+    if (!currentArchive) return;
+    var gen = generation;
+    setStatus('Testing "' + currentArchive.name + '"…');
+    sendRequest('test', {
+      archive: { name: currentArchive.name, data: currentArchive.data },
+      password: currentPassword(),
+    }).then(
+      function (res) {
+        if (gen !== generation) return;
+        if (res.ok) setStatus('"' + currentArchive.name + '": test passed — archive is OK');
+        else setStatus('"' + currentArchive.name + '": test FAILED', true);
+      },
+      function (err) {
+        if (gen !== generation) return;
+        setStatus(err && err.message ? err.message : String(err), true);
+      }
+    );
+  }
+
+  function onExtractAll() {
+    if (!currentArchive) return;
+    var gen = generation;
+    setStatus('Extracting "' + currentArchive.name + '"…');
+    sendRequest('extract', {
+      archive: { name: currentArchive.name, data: currentArchive.data },
+      password: currentPassword(),
+    }).then(
+      function (res) {
+        if (gen !== generation) return;
+        var files = res.files || [];
+        files.forEach(function (f) {
+          addDownload(f.path, f.data);
+        });
+        setStatus('Extracted ' + files.length + ' file' + (files.length === 1 ? '' : 's') + ' from "' + currentArchive.name + '"');
+      },
+      function (err) {
+        if (gen !== generation) return;
+        setStatus(err && err.message ? err.message : String(err), true);
+      }
+    );
+  }
+
+  function onCompress() {
+    if (!queuedFiles.length) {
+      setStatus('Nothing to compress — drop some files first', true);
+      return;
+    }
+    var gen = generation;
+    var format = formatSelect.value === 'zip' ? 'zip' : '7z';
+    var level = levelSelect.value;
+    var password = currentPassword();
+    // No encrypt-headers checkbox in the DOM contract: headers are encrypted
+    // whenever a password is set and the format is 7z.
+    var encryptHeaders = !!password && format === '7z';
+    var archiveName = baseName(queuedFiles[0].name) + '.' + format;
+
+    setStatus('Compressing ' + queuedFiles.length + ' file' + (queuedFiles.length > 1 ? 's' : '') + '…');
+    sendRequest('compress', {
+      files: queuedFiles.map(function (f) {
+        return { path: f.path, data: f.data };
+      }),
+      archiveName: archiveName,
+      format: format,
+      level: level,
+      password: password,
+      encryptHeaders: encryptHeaders,
+    }).then(
+      function (res) {
+        if (gen !== generation) return;
+        addDownload(res.archive.name, res.archive.data);
+        setStatus('Created "' + res.archive.name + '" (' + humanSize(res.archive.data.byteLength) + ')');
+      },
+      function (err) {
+        if (gen !== generation) return;
+        setStatus(err && err.message ? err.message : String(err), true);
+      }
+    );
+  }
+
+  function onClear() {
+    // Cancel the UI side of anything in flight: bump the generation so
+    // pending callbacks no-op, mute their progress lines, and reject the
+    // tracked requests. The worker itself cannot be interrupted mid-callMain;
+    // its late replies hit the empty pending map and are ignored.
+    generation++;
+    pending.forEach(function (entry, id) {
+      if (entry.requestType !== 'init') staleProgressIds.add(id);
+      entry.reject(new Error('Cleared'));
+    });
+    pending.clear();
+    busy = false;
+
+    queuedFiles = [];
+    currentArchive = null;
+    renderCompressList();
+    renderEntries([]);
+    archivePanel.hidden = true;
+    compressPanel.hidden = true;
+    archiveNameEl.textContent = '';
+    downloadsEl.textContent = '';
+    objectUrls.forEach(function (url) {
+      URL.revokeObjectURL(url);
+    });
+    objectUrls = [];
+    progressLines = [];
+    progressOutput.textContent = '';
+    if (passwordInput) passwordInput.value = '';
+    setStatus(initialStatusText);
+    pumpQueue();
+  }
+
+  // ------------------------------------------------------- PWA + environment ---
+
+  function registerServiceWorker() {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js').catch(function (err) {
+        console.warn('[7zip-web] service worker registration failed:', err);
+      });
+    }
+  }
+
+  function updateNetStatus() {
+    var online = navigator.onLine !== false;
+    netStatus.classList.toggle('online', online);
+    netStatus.classList.toggle('offline', !online);
+    netStatus.textContent = online ? 'Online' : 'Offline';
+  }
+
+  function loadBuildInfo() {
+    fetch('./build-info.json')
+      .then(function (resp) {
+        if (!resp.ok) throw new Error('build-info.json: HTTP ' + resp.status);
+        return resp.json();
+      })
+      .then(function (info) {
+        if (!info || !info.version) throw new Error('build-info.json: no version');
+        var em = info.emscripten ? ' (emscripten ' + info.emscripten + ')' : '';
+        buildVersion.textContent = 'v' + info.version + em;
+      })
+      .catch(function () {
+        // Missing/failing build-info.json is normal offline and in dev — silent.
+        buildVersion.textContent = 'local';
+      });
+  }
+
+  function setupInstallPrompt() {
+    window.addEventListener('beforeinstallprompt', function (ev) {
+      ev.preventDefault();
+      deferredInstallPrompt = ev;
+      installBtn.hidden = false;
+    });
+    installBtn.addEventListener('click', function () {
+      if (!deferredInstallPrompt) return;
+      var promptEvent = deferredInstallPrompt;
+      deferredInstallPrompt = null;
+      installBtn.hidden = true;
+      promptEvent.prompt();
+      if (promptEvent.userChoice && typeof promptEvent.userChoice.then === 'function') {
+        promptEvent.userChoice.catch(function () {});
+      }
+    });
+    window.addEventListener('appinstalled', function () {
+      deferredInstallPrompt = null;
+      installBtn.hidden = true;
+    });
+  }
+
+  function setupFileIntake() {
+    dropzone.addEventListener('click', function (ev) {
+      if (ev.target !== fileInput) fileInput.click();
+    });
+    dropzone.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        fileInput.click();
+      }
+    });
+    fileInput.addEventListener('change', function () {
+      handleIncomingFiles(fileInput.files);
+      fileInput.value = ''; // allow re-selecting the same file
+    });
+
+    ['dragenter', 'dragover'].forEach(function (type) {
+      dropzone.addEventListener(type, function (ev) {
+        ev.preventDefault();
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+        dropzone.classList.add('dragover');
+      });
+    });
+    ['dragleave', 'dragend'].forEach(function (type) {
+      dropzone.addEventListener(type, function (ev) {
+        ev.preventDefault();
+        dropzone.classList.remove('dragover');
+      });
+    });
+    dropzone.addEventListener('drop', function (ev) {
+      ev.preventDefault();
+      dropzone.classList.remove('dragover');
+      var dt = ev.dataTransfer;
+      if (!dt) return;
+      if (dt.files && dt.files.length) handleIncomingFiles(dt.files);
+    });
+    // Never let stray drops on the page navigate away.
+    ['dragover', 'drop'].forEach(function (type) {
+      window.addEventListener(type, function (ev) {
+        if (ev.target !== dropzone && !dropzone.contains(ev.target)) ev.preventDefault();
+      });
+    });
+  }
+
+  // ------------------------------------------------------------------ boot ---
+
+  function boot() {
+    dropzone = $('dropzone');
+    fileInput = $('file-input');
+    statusLine = $('status-line');
+    progressOutput = $('progress-output');
+    archivePanel = $('archive-panel');
+    archiveNameEl = $('archive-name');
+    entriesBody = $('entries-body');
+    btnExtractAll = $('btn-extract-all');
+    btnTestArchive = $('btn-test-archive');
+    compressPanel = $('compress-panel');
+    compressList = $('compress-list');
+    formatSelect = $('format-select');
+    levelSelect = $('level-select');
+    passwordInput = $('password-input');
+    btnCompress = $('btn-compress');
+    downloadsEl = $('downloads');
+    installBtn = $('install-btn');
+    netStatus = $('net-status');
+    buildVersion = $('build-version');
+    btnClear = $('btn-clear');
+
+    initialStatusText = statusLine ? statusLine.textContent.trim() : '';
+
+    archivePanel.hidden = true;
+    compressPanel.hidden = true;
+    installBtn.hidden = true;
+
+    setupFileIntake();
+    setupInstallPrompt();
+
+    btnExtractAll.addEventListener('click', onExtractAll);
+    btnTestArchive.addEventListener('click', onTestArchive);
+    btnCompress.addEventListener('click', onCompress);
+    btnClear.addEventListener('click', onClear);
+
+    updateNetStatus();
+    window.addEventListener('online', updateNetStatus);
+    window.addEventListener('offline', updateNetStatus);
+
+    loadBuildInfo();
+    registerServiceWorker();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+})();

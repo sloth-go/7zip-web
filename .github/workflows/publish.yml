@@ -1,0 +1,203 @@
+name: Build & Publish 7-Zip WASM
+
+on:
+  schedule:
+    - cron: '0 4 * * 1' # every Monday 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '7-Zip git ref (tag, branch or commit) to build'
+        required: false
+        default: ''
+      skip_build:
+        description: 'Skip building (redeploy site with wasm from the latest successful build)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  actions: read # needed to fetch the wasm-build artifact from a previous run (skip_build)
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  EM_VERSION: 4.0.10
+  EM_CACHE_FOLDER: emsdk-cache
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout site repository
+        uses: actions/checkout@v5
+
+      - name: Resolve 7-Zip source ref
+        if: ${{ !inputs.skip_build }}
+        id: ref
+        run: |
+          if [ -n "${{ inputs.ref }}" ]; then
+            echo "ref=${{ inputs.ref }}" >> "$GITHUB_OUTPUT"
+          else
+            # latest tag (highest version) from upstream ip7z/7zip
+            REF=$(git ls-remote --tags --refs https://github.com/ip7z/7zip.git \
+                  | awk -F/ '{print $NF}' | sort -V | tail -1)
+            if [ -z "$REF" ]; then
+              echo "Failed to resolve latest tag from upstream, falling back to 26.06"
+              REF="26.06"
+            fi
+            echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Building 7-Zip ref: $REF"
+
+      - name: Checkout 7-Zip source
+        if: ${{ !inputs.skip_build }}
+        uses: actions/checkout@v5
+        with:
+          repository: ip7z/7zip
+          ref: ${{ steps.ref.outputs.ref }}
+          path: 7zip
+          fetch-depth: 1
+
+      - name: Setup Emscripten
+        if: ${{ !inputs.skip_build }}
+        uses: mymindstorm/setup-emsdk@v18
+        with:
+          version: ${{ env.EM_VERSION }}
+          actions-cache-folder: ${{ env.EM_CACHE_FOLDER }}
+
+      - name: Verify Emscripten
+        if: ${{ !inputs.skip_build }}
+        run: emcc --version | head -1
+
+      - name: Normalize line endings
+        if: ${{ !inputs.skip_build }}
+        run: find 7zip -name '*.mak' -exec sed -i 's/\r$//' {} +
+
+      - name: Build 7zz WASM
+        if: ${{ !inputs.skip_build }}
+        run: |
+          # Compile the shim: emscripten lacks sysinfo() (7-Zip GetRamSize())
+          # and its __syscall_umask stub defaults the umask to 0777, which
+          # would zero 7-Zip's C_umask mask and make every extracted file
+          # mode 0000 (EACCES). See emscripten_shim.c for details.
+          emcc -c .github/scripts/emscripten_shim.c -o "$GITHUB_WORKSPACE/shim.o"
+          cd 7zip/CPP/7zip/Bundles/Alone2
+          # ST_MODE=1 -> -DZ7_ST (single-threaded): GitHub Pages cannot serve
+          # the COOP/COEP headers required for SharedArrayBuffer/pthreads.
+          # CFLAGS_WARN: warn_gcc.mak's GCC-only warning flags are unknown to
+          # clang/emcc; neutralize them (with -Werror active this is fatal).
+          # PROG=7zz.js: emscripten names the JS glue after the -o basename,
+          # so the target must carry the .js extension.
+          # NOTE: no --no-entry here — it dead-strips callMain from the
+          # generated JS even when listed in EXPORTED_RUNTIME_METHODS.
+          # -sINVOKE_RUN=0 already prevents auto-running main().
+          # EXIT_RUNTIME=0 keeps the runtime alive so the web app can call
+          # callMain() repeatedly (compress, list, extract, ...); with
+          # EXIT_RUNTIME=1 the first callMain tears the runtime down.
+          # ENVIRONMENT includes node so the CI smoke test can run the
+          # same artifact the browser loads.
+          make -j"$(nproc)" -f ../../cmpl_gcc.mak \
+            CC=emcc CXX=em++ \
+            O=b/wasm \
+            ST_MODE=1 \
+            PROG=7zz.js \
+            CFLAGS_WARN=-Wno-unknown-warning-option \
+            LDFLAGS_STATIC_3="-sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sMODULARIZE=1 -sEXPORT_NAME=create7zip -sEXPORTED_RUNTIME_METHODS=['callMain','FS'] -sALLOW_MEMORY_GROWTH=1 -sFILESYSTEM=1 -sENVIRONMENT='web,worker,node' -O3 $GITHUB_WORKSPACE/shim.o"
+
+      - name: Smoke-test WASM build with Node
+        if: ${{ !inputs.skip_build }}
+        run: |
+          node .github/scripts/wasm-smoke-test.mjs \
+            7zip/CPP/7zip/Bundles/Alone2/b/wasm/7zz.js \
+            7zip/CPP/7zip/Bundles/Alone2/b/wasm/7zz.wasm
+
+      - name: Stage wasm + build metadata
+        if: ${{ !inputs.skip_build }}
+        run: |
+          mkdir -p wasm-stage
+          cp 7zip/CPP/7zip/Bundles/Alone2/b/wasm/7zz.js wasm-stage/
+          cp 7zip/CPP/7zip/Bundles/Alone2/b/wasm/7zz.wasm wasm-stage/
+          V=$(sed -n 's/.*MY_VERSION_NUMBERS[[:space:]]*"\([^"]*\)".*/\1/p' 7zip/C/7zVersion.h | head -1)
+          [ -n "$V" ] || { echo "No version found in 7zVersion.h"; exit 1; }
+          SHA=$(cd 7zip && git rev-parse HEAD)
+          cat > wasm-stage/build-info.json <<EOF
+          {
+            "version": "$V",
+            "ref": "${{ steps.ref.outputs.ref }}",
+            "commit": "$SHA",
+            "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "emscripten": "${{ env.EM_VERSION }}"
+          }
+          EOF
+          cat wasm-stage/build-info.json
+
+      - name: Upload wasm-build artifact
+        if: ${{ !inputs.skip_build }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-build
+          path: wasm-stage/
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Reuse wasm from latest successful build
+        if: ${{ inputs.skip_build }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN_ID=$(gh run list --workflow=publish.yml --status=success \
+                     --limit 5 --json databaseId --jq '.[0].databaseId' || true)
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::skip_build requested but no previous successful run of this workflow exists to reuse wasm from."
+            exit 1
+          fi
+          echo "Reusing wasm-build artifact from run $RUN_ID"
+          rm -rf wasm-stage
+          gh run download "$RUN_ID" --name wasm-build --dir wasm-stage
+          ls -la wasm-stage/
+          cat wasm-stage/build-info.json
+
+      - name: Stage site assets
+        run: |
+          set -euo pipefail
+          # Site files (index.html, app.js, sw.js, icons/, ...) live at repo
+          # root; the wasm build (fresh or reused) lands in wasm/.
+          rsync -a \
+            --exclude='.github' --exclude='.git' --exclude='.gitignore' \
+            --exclude='README.md' \
+            --exclude='7zip' --exclude='wasm' --exclude='wasm-stage' \
+            --exclude='site-publish' --exclude='node_modules' \
+            ./ site-publish/
+          mkdir -p site-publish/wasm
+          cp wasm-stage/7zz.js wasm-stage/7zz.wasm site-publish/wasm/
+          cp wasm-stage/build-info.json site-publish/
+          echo "--- site-publish ---"
+          find site-publish -type f | sort
+
+      - name: Generate service worker asset list
+        run: |
+          node .github/scripts/generate-sw-manifest.mjs site-publish
+          cat site-publish/sw-manifest.js
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site-publish
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -5,6 +5,10 @@
  * single-threaded: exactly one job in flight at a time), file intake via
  * #dropzone / #file-input, the archive and compress panels, streamed progress,
  * downloads, install prompt, online/offline pill and build-info version pill.
+ * Where the browser supports them it also wires up OS-level file handling:
+ * launch-queue files ("Open with"), share-target files (Android share sheet)
+ * and the native open / extract-to-folder / save-as pickers — all of it
+ * feature-detected, so unsupported browsers keep the existing behavior.
  *
  * Every URL is RELATIVE — the site must work from any subpath and offline.
  */
@@ -16,6 +20,29 @@
     'zst', 'tzst', 'iso', 'cab', 'lzma', 'lzh', 'arj',
   ];
   var MAX_PROGRESS_LINES = 200;
+
+  // MIME type -> extensions map for the native pickers. Must cover exactly
+  // the ARCHIVE_EXTS list above and mirror the manifest file_handlers entry
+  // (extensions WITH the leading dot, per the picker/manifest specs).
+  var ARCHIVE_ACCEPT = {
+    'application/x-7z-compressed': ['.7z'],
+    'application/zip': ['.zip'],
+    'application/vnd.rar': ['.rar'],
+    'application/x-tar': ['.tar'],
+    'application/gzip': ['.gz', '.tgz'],
+    'application/x-bzip2': ['.bz2', '.tbz'],
+    'application/x-xz': ['.xz', '.txz'],
+    'application/zstd': ['.zst', '.tzst'],
+    'application/x-iso9660-image': ['.iso'],
+    'application/vnd.ms-cab-compressed': ['.cab'],
+    'application/x-lzma': ['.lzma'],
+    'application/x-lzh-compressed': ['.lzh'],
+    'application/x-arj': ['.arj'],
+  };
+
+  // Fixed-name cache sw.js stashes share-target files in (never versioned —
+  // an unconsumed share must survive a service-worker update).
+  var SHARED_CACHE = '7zip-web-shared';
 
   // ----------------------------------------------------------------- state ---
   var worker = null;
@@ -40,8 +67,8 @@
   var staleProgressIds = new Set(); // ids whose progress lines Clear muted
 
   // ------------------------------------------------------------------- dom ---
-  var dropzone, fileInput, statusLine, progressOutput;
-  var archivePanel, archiveNameEl, entriesBody, btnExtractAll, btnTestArchive;
+  var dropzone, fileInput, statusLine, progressOutput, btnOpenArchive;
+  var archivePanel, archiveNameEl, entriesBody, btnExtractAll, btnExtractFolder, btnTestArchive;
   var compressPanel, compressList, formatSelect, levelSelect, passwordInput, btnCompress;
   var downloadsEl, installBtn, netStatus, buildVersion, btnClear;
   var initialStatusText = '';
@@ -414,6 +441,10 @@
     var blob = new Blob([buffer]);
     var url = URL.createObjectURL(blob);
     objectUrls.push(url); // kept alive until Clear revokes them
+    // Row wrapper: the download link plus (where supported) a "Save as…"
+    // button writing the buffer to a real file via the native save picker.
+    var row = document.createElement('div');
+    row.className = 'download-row';
     var a = document.createElement('a');
     a.href = url;
     a.download = baseName(name);
@@ -423,7 +454,186 @@
     size.textContent = humanSize(buffer.byteLength);
     a.appendChild(label);
     a.appendChild(size);
-    downloadsEl.appendChild(a);
+    row.appendChild(a);
+    if (typeof window.showSaveFilePicker === 'function') {
+      var saveBtn = document.createElement('button');
+      saveBtn.type = 'button';
+      saveBtn.className = 'btn btn-save-as';
+      saveBtn.textContent = 'Save as…';
+      saveBtn.addEventListener('click', function () {
+        saveBufferAs(baseName(name), buffer);
+      });
+      row.appendChild(saveBtn);
+    }
+    downloadsEl.appendChild(row);
+  }
+
+  // ---------------------------------------------- native pickers (Chromium) ---
+  // File System Access API flows. Every picker call must happen synchronously
+  // inside a click handler (transient user activation) — hence the promise
+  // chains hanging directly off the *Picker() calls.
+
+  function onOpenArchive() {
+    window
+      .showOpenFilePicker({
+        multiple: true,
+        id: '7zip-open',
+        startIn: 'downloads',
+        types: [{ description: 'Archives', accept: ARCHIVE_ACCEPT }],
+      })
+      .then(function (handles) {
+        return Promise.all(
+          handles.map(function (handle) {
+            return handle.getFile();
+          })
+        );
+      })
+      .then(function (files) {
+        if (files.length) handleIncomingFiles(files);
+      })
+      .catch(function (err) {
+        if (err && err.name === 'AbortError') return; // picker dismissed
+        setStatus(
+          'Could not open the file picker: ' + (err && err.message ? err.message : err),
+          true
+        );
+      });
+  }
+
+  // Extract straight into a user-chosen directory. Deliberately adds nothing
+  // to the downloads list — the files land on the real file system.
+  function onExtractToFolder() {
+    if (!currentArchive) return;
+    var gen = generation;
+    window
+      .showDirectoryPicker({ mode: 'readwrite', id: '7zip-extract', startIn: 'downloads' })
+      .then(function (dirHandle) {
+        if (gen !== generation) return null;
+        setStatus('Extracting "' + currentArchive.name + '" to folder…');
+        return sendRequest('extract', {
+          archive: { name: currentArchive.name, data: currentArchive.data },
+          password: currentPassword(),
+        }).then(function (res) {
+          if (gen !== generation) return null;
+          return writeFilesToDirectory(dirHandle, res.files || []);
+        });
+      })
+      .then(function (result) {
+        if (gen !== generation || !result) return;
+        setStatus(
+          result.failed
+            ? 'Extracted ' + result.written + ' file(s); ' + result.failed + ' could not be written'
+            : 'Extracted ' + result.written + ' file(s) to the chosen folder',
+          !!result.failed
+        );
+      })
+      .catch(function (err) {
+        if (gen !== generation) return;
+        if (err && err.name === 'AbortError') return; // dismissed or permission denied
+        setStatus(err && err.message ? err.message : String(err), true);
+      });
+  }
+
+  // Containment for archive entry paths written through directory handles —
+  // the same algorithm as worker.js safeRelPath ('..' pops when possible and
+  // is ignored at the root), plus drive-letter segments ("C:") are dropped
+  // because these paths hit the real file system, not MEMFS.
+  function safeExtractPath(p) {
+    var s = String(p === null || p === undefined ? '' : p);
+    s = s.replace(/\\/g, '/').replace(/\0/g, '');
+    var segs = s.split('/');
+    var out = [];
+    for (var i = 0; i < segs.length; i++) {
+      var seg = segs[i];
+      if (seg === '' || seg === '.') continue;
+      if (seg === '..') {
+        if (out.length) out.pop();
+        continue;
+      }
+      if (/^[A-Za-z]:$/.test(seg)) continue; // drive letter
+      out.push(seg);
+    }
+    return out.join('/');
+  }
+
+  // Sequential on purpose: entries share parent directories, and one
+  // unwritable file (permissions, illegal name, ...) must not abort the rest.
+  async function writeFilesToDirectory(dirHandle, files) {
+    var written = 0;
+    var failed = 0;
+    for (var i = 0; i < files.length; i++) {
+      var file = files[i];
+      var rel = file ? safeExtractPath(file.path) : '';
+      if (!rel || !file.data) {
+        failed++;
+        continue;
+      }
+      try {
+        var segs = rel.split('/');
+        var dir = dirHandle;
+        for (var j = 0; j < segs.length - 1; j++) {
+          dir = await dir.getDirectoryHandle(segs[j], { create: true });
+        }
+        var fileHandle = await dir.getFileHandle(segs[segs.length - 1], { create: true });
+        var writable = await fileHandle.createWritable();
+        await writable.write(new Blob([file.data]));
+        await writable.close(); // nothing is on disk before close() resolves
+        written++;
+      } catch (err) {
+        failed++;
+        console.warn('[7zip-web] could not write "' + rel + '":', err);
+      }
+    }
+    return { written: written, failed: failed };
+  }
+
+  // Save-picker filter: reuse the archive MIME type for known archive
+  // extensions, otherwise offer a generic filter for the extension; with no
+  // usable (or no spec-valid) extension the picker defaults are left alone.
+  function typesForSave(name) {
+    var ext = extOf(name);
+    if (!ext) return null;
+    var dotted = '.' + ext;
+    // The File System Access spec only accepts suffixes of ASCII alphanumeric
+    // characters (plus '+'), at most 16 code points — anything else (hyphens,
+    // underscores, non-ASCII, longer names) makes showSaveFilePicker reject
+    // with a TypeError, so those files fall back to the picker defaults.
+    if (!/^\.[A-Za-z0-9+.]{1,15}$/.test(dotted)) return null;
+    var mimes = Object.keys(ARCHIVE_ACCEPT).filter(function (mime) {
+      return ARCHIVE_ACCEPT[mime].indexOf(dotted) >= 0;
+    });
+    var accept = {};
+    if (mimes.length) {
+      accept[mimes[0]] = [dotted];
+      return [{ description: 'Archive file', accept: accept }];
+    }
+    accept['application/octet-stream'] = [dotted];
+    return [{ description: 'All files', accept: accept }];
+  }
+
+  function saveBufferAs(suggestedName, buffer) {
+    var options = { suggestedName: suggestedName, id: '7zip-save', startIn: 'downloads' };
+    var types = typesForSave(suggestedName);
+    if (types) options.types = types;
+    window
+      .showSaveFilePicker(options)
+      .then(function (handle) {
+        return handle.createWritable();
+      })
+      .then(function (writable) {
+        // Keep the writable reference: close() must run on the same stream
+        // the bytes were written to, and must be awaited.
+        return writable.write(new Blob([buffer])).then(function () {
+          return writable.close();
+        });
+      })
+      .then(function () {
+        setStatus('Saved "' + suggestedName + '"');
+      })
+      .catch(function (err) {
+        if (err && err.name === 'AbortError') return; // picker dismissed
+        setStatus(err && err.message ? err.message : String(err), true);
+      });
   }
 
   // ------------------------------------------------------------ operations ---
@@ -550,6 +760,83 @@
     }
   }
 
+  // Desktop "Open with": the OS launches the installed PWA with file handles
+  // queued on window.launchQueue. The queue buffers them until a consumer is
+  // registered, so setting it here (at boot) cannot miss the launch.
+  function setupLaunchQueue() {
+    if (
+      !('launchQueue' in window) ||
+      !window.launchQueue ||
+      typeof window.launchQueue.setConsumer !== 'function'
+    ) {
+      return;
+    }
+    window.launchQueue.setConsumer(function (params) {
+      if (!params || !params.files || !params.files.length) return;
+      Promise.all(
+        params.files.map(function (handle) {
+          return handle && typeof handle.getFile === 'function' ? handle.getFile() : handle;
+        })
+      )
+        .then(function (files) {
+          handleIncomingFiles(
+            files.filter(function (f) {
+              return f && typeof f.arrayBuffer === 'function';
+            })
+          );
+        })
+        .catch(function (err) {
+          setStatus(
+            'Could not read the launched file(s): ' + (err && err.message ? err.message : err),
+            true
+          );
+        });
+    });
+  }
+
+  // Android share sheet: sw.js stashed the shared files in SHARED_CACHE and
+  // redirected here. Read ALL entries, delete ALL of them, and only then
+  // process — in that order, so a reload can never ingest a share twice.
+  // Returns a promise that never rejects: a broken cache must not break boot.
+  function consumeSharedFiles() {
+    if (!('caches' in window)) return Promise.resolve();
+    return caches
+      .open(SHARED_CACHE)
+      .then(function (cache) {
+        return cache.keys().then(function (keys) {
+          if (!keys.length) return undefined;
+          var fileKeys = keys.filter(function (key) {
+            return !new URL(key.url).pathname.endsWith('/__shared/count');
+          });
+          return Promise.all(
+            fileKeys.map(function (key) {
+              return cache.match(key).then(function (resp) {
+                return resp.blob().then(function (blob) {
+                  var name = decodeURIComponent(resp.headers.get('X-File-Name') || '');
+                  return new File(
+                    [blob],
+                    name || baseName(new URL(key.url).pathname),
+                    { type: blob.type || '' }
+                  );
+                });
+              });
+            })
+          ).then(function (files) {
+            return Promise.all(
+              keys.map(function (key) {
+                return cache.delete(key);
+              })
+            ).then(function () {
+              if (files.length) handleIncomingFiles(files);
+            });
+          });
+        });
+      })
+      .catch(function (err) {
+        console.warn('[7zip-web] could not consume shared files:', err);
+      });
+  }
+
   function updateNetStatus() {
     var online = navigator.onLine !== false;
     netStatus.classList.toggle('online', online);
@@ -646,10 +933,12 @@
     fileInput = $('file-input');
     statusLine = $('status-line');
     progressOutput = $('progress-output');
+    btnOpenArchive = $('btn-open-archive');
     archivePanel = $('archive-panel');
     archiveNameEl = $('archive-name');
     entriesBody = $('entries-body');
     btnExtractAll = $('btn-extract-all');
+    btnExtractFolder = $('btn-extract-folder');
     btnTestArchive = $('btn-test-archive');
     compressPanel = $('compress-panel');
     compressList = $('compress-list');
@@ -671,11 +960,25 @@
 
     setupFileIntake();
     setupInstallPrompt();
+    setupLaunchQueue();
+    consumeSharedFiles();
 
     btnExtractAll.addEventListener('click', onExtractAll);
     btnTestArchive.addEventListener('click', onTestArchive);
     btnCompress.addEventListener('click', onCompress);
     btnClear.addEventListener('click', onClear);
+
+    // Native pickers are feature-detected: on browsers without them (Firefox,
+    // Safari) the buttons stay hidden and the dropzone / download links remain
+    // the only intake and output, exactly as before.
+    if (typeof window.showOpenFilePicker === 'function') {
+      btnOpenArchive.addEventListener('click', onOpenArchive);
+      btnOpenArchive.hidden = false;
+    }
+    if (typeof window.showDirectoryPicker === 'function') {
+      btnExtractFolder.addEventListener('click', onExtractToFolder);
+      btnExtractFolder.hidden = false;
+    }
 
     updateNetStatus();
     window.addEventListener('online', updateNetStatus);

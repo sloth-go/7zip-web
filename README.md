@@ -12,6 +12,23 @@ browser** — no uploads, no server-side processing, works offline after the fir
 - Installable PWA with a versioned service-worker cache: every weekly build invalidates
   the cache automatically
 
+## File handling
+
+When installed, the PWA doubles as a system-level archive handler. Everything here is
+feature-detected; browsers without support keep the plain dropzone/download behavior:
+
+- **Open with** (desktop Chrome/Edge): `file_handlers` in `manifest.webmanifest`
+  registers the app for the supported archive extensions; launched files arrive via
+  `window.launchQueue` and open like dropped ones.
+- **Share sheet** (Android Chrome): `share_target` receives shared files as a POST to
+  `./__share`, which the service worker intercepts, stashes in a dedicated cache and
+  answers with a redirect; the app picks the files up on the next load.
+- **Native pickers** (Chromium only): “Open archive…” (`showOpenFilePicker`),
+  “Extract to folder…” writes entries into a real directory (`showDirectoryPicker`),
+  and each download row offers “Save as…” (`showSaveFilePicker`).
+- Everywhere else (Firefox, Safari, …) these entry points stay hidden and nothing
+  changes.
+
 ## How publishing works
 
 `.github/workflows/publish.yml` runs **every Monday 04:00 UTC** (and on demand):

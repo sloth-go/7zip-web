@@ -29,5 +29,42 @@
       "type": "image/png",
       "purpose": "any maskable"
     }
-  ]
+  ],
+  "file_handlers": [
+    {
+      "action": "./",
+      "accept": {
+        "application/x-7z-compressed": [".7z"],
+        "application/zip": [".zip"],
+        "application/vnd.rar": [".rar"],
+        "application/x-tar": [".tar"],
+        "application/gzip": [".gz", ".tgz"],
+        "application/x-bzip2": [".bz2", ".tbz"],
+        "application/x-xz": [".xz", ".txz"],
+        "application/zstd": [".zst", ".tzst"],
+        "application/x-iso9660-image": [".iso"],
+        "application/vnd.ms-cab-compressed": [".cab"],
+        "application/x-lzma": [".lzma"],
+        "application/x-lzh-compressed": [".lzh"],
+        "application/x-arj": [".arj"]
+      },
+      "launch_type": "multiple-clients"
+    }
+  ],
+  "share_target": {
+    "action": "./__share",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url",
+      "files": [
+        {
+          "name": "files",
+          "accept": ["*/*"]
+        }
+      ]
+    }
+  }
 }

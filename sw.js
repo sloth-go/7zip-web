@@ -23,6 +23,10 @@ try {
 }
 
 var CACHE = '7zip-web-' + (self.__SW_VERSION__ || 'dev');
+// Files arriving via the manifest share_target are stashed under this FIXED
+// name: the app-shell cache is version-keyed and deleted on every build, but
+// a shared file the app has not consumed yet must survive an update.
+var SHARED_CACHE = '7zip-web-shared';
 var ASSETS = Array.isArray(self.__SW_ASSETS__) ? self.__SW_ASSETS__.slice() : [];
 
 // Absolute URLs for the precache list. Resolved against this script's own
@@ -32,6 +36,8 @@ var ASSET_URLS = ASSETS.map(function (entry) {
 });
 var INDEX_URL = new URL('./index.html', self.location).href;
 var OFFLINE_URL = new URL('./offline.html', self.location).href;
+// Endpoint the manifest share_target POSTs to (intercepted in the fetch handler).
+var SHARE_URL = new URL('./__share', self.location);
 
 // Last-resort navigation body, used only if offline.html itself is not cached.
 var OFFLINE_HTML =
@@ -94,7 +100,7 @@ self.addEventListener('activate', function (event) {
       const keys = await caches.keys();
       await Promise.all(
         keys
-          .filter(function (key) { return key !== CACHE; })
+          .filter(function (key) { return key !== CACHE && key !== SHARED_CACHE; })
           .map(function (key) { return caches.delete(key); })
       );
       await self.clients.claim();
@@ -171,12 +177,69 @@ async function cacheFirstResponse(request) {
   return response;
 }
 
+/* ----------------------------------------------------------- share target */
+
+// Android share sheet: the manifest points share POSTs at ./__share. The
+// multipart files are stashed in SHARED_CACHE under synthetic URLs (the real
+// name travels in a header) for the app to consume on the next load, and the
+// navigation is answered with a 303 redirect — a 200 would leave the browser
+// on a blank page whose reload re-POSTs the form. Every failure path still
+// redirects: the share must never strand the user.
+async function handleSharePost(request) {
+  try {
+    const form = await request.formData();
+    const files = form.getAll('files').filter(function (v) { return v instanceof Blob; });
+    const cache = await caches.open(SHARED_CACHE);
+    // Clear leftovers from a previous, never-consumed share first.
+    const stale = await cache.keys();
+    await Promise.all(
+      stale.map(function (key) { return cache.delete(key); })
+    );
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      await cache.put(
+        new URL('./__shared/' + i, self.location).href,
+        new Response(file, {
+          headers: {
+            'X-File-Name': encodeURIComponent(file.name || ('file' + i)),
+            'Content-Type': file.type || 'application/octet-stream'
+          }
+        })
+      );
+    }
+    await cache.put(
+      new URL('./__shared/count', self.location).href,
+      new Response(String(files.length), {
+        headers: { 'Content-Type': 'text/plain' }
+      })
+    );
+  } catch (err) {
+    console.warn('[sw] share-target handling failed: ' + (err && err.message ? err.message : err));
+  }
+  return new Response(null, {
+    status: 303,
+    headers: { Location: new URL('./', self.location).href }
+  });
+}
+
 self.addEventListener('fetch', function (event) {
   const request = event.request;
-  if (!request || request.method !== 'GET') return; // let the browser handle it
+  // POST is let through only for the share-target branch below; every other
+  // non-GET method is left to the browser, as before.
+  if (!request || (request.method !== 'GET' && request.method !== 'POST')) return;
 
   const url = requestUrl(request);
   if (!url || !isHttp(url)) return; // data:, blob:, ... — untouched
+
+  if (request.method === 'POST') {
+    // Only our own same-origin ./__share is ours; all other POSTs (navigations
+    // and cross-origin requests included) never reach navigationResponse and
+    // are handled by the network stack.
+    if (url.origin === SHARE_URL.origin && url.pathname === SHARE_URL.pathname) {
+      event.respondWith(handleSharePost(request));
+    }
+    return;
+  }
 
   if (request.mode === 'navigate') {
     event.respondWith(navigationResponse(request));

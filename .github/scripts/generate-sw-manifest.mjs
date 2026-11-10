@@ -22,7 +22,7 @@ const USAGE = 'usage: node generate-sw-manifest.mjs <site-dir>';
 const TOP_LEVEL_EXCLUDES = new Set(['sw.js', 'sw-manifest.js', 'build-info.json']);
 
 // Directory/file name components skipped at any depth.
-const EXCLUDED_DIRS = new Set(['node_modules']);
+const EXCLUDED_DIRS = new Set(['node_modules', 'tests']);
 
 // Always listed, even if the walk did not find them on disk, so the service
 // worker can always fall back to a cached shell when the network is down.

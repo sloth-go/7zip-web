@@ -220,6 +220,7 @@
     #dropzone svg { color: var(--accent); flex: none; }
     .dz-title { margin: 0; font-size: 1.15rem; font-weight: 700; text-wrap: balance; }
     .dz-sub { margin: 0; max-width: 36rem; color: var(--muted); font-size: 0.9rem; text-wrap: pretty; }
+    .dz-actions { text-align: center; margin: 0.6rem 0 0; }
 
     /* ---------- status + output ---------- */
     #status-line {
@@ -351,6 +352,9 @@
     /* ---------- downloads ---------- */
     #downloads { display: flex; flex-direction: column; gap: 0.6rem; }
     #downloads:empty { display: none; }
+    #downloads .download-row { display: flex; align-items: center; gap: 0.6rem; }
+    .download-row a { flex: 1 1 auto; min-width: 0; }
+    .download-row .btn-save-as { flex: none; white-space: nowrap; }
     #downloads a {
       display: flex;
       align-items: center;
@@ -446,6 +450,7 @@
         <p class="dz-sub">…or click anywhere in this box to browse. 7-Zip runs locally via WebAssembly — your files never leave your device.</p>
       </div>
       <input id="file-input" type="file" multiple hidden>
+      <p class="dz-actions"><button id="btn-open-archive" type="button" class="btn" aria-label="Open an archive with the native file picker" hidden>Open archive…</button></p>
     </section>
 
     <p id="status-line" role="status" aria-live="polite"></p>
@@ -460,6 +465,7 @@
         <h2>Archive: <span id="archive-name"></span></h2>
         <div class="panel-actions">
           <button id="btn-extract-all" type="button" class="btn primary">Extract all</button>
+          <button id="btn-extract-folder" type="button" class="btn" aria-label="Extract all entries into a folder you choose" hidden>Extract to folder…</button>
           <button id="btn-test-archive" type="button" class="btn">Test archive</button>
         </div>
       </div>

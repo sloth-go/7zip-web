@@ -1,0 +1,291 @@
+// Contract self-check for <repo>/index.html
+// Zero dependencies. Run: node tests/index-html.test.mjs  (from the repo root)
+import { readFileSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+import assert from 'node:assert/strict';
+
+// Repo root derived from this file's own location (tests/..).
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const FILE = ROOT + '/index.html';
+const html = readFileSync(FILE, 'utf8');
+
+// The 22 contract ids: the original 20 plus the two feature-detected native
+// picker buttons (Open archive… / Extract to folder…).
+const EXPECTED_IDS = [
+  'dropzone', 'file-input', 'btn-open-archive', 'status-line', 'progress-output',
+  'archive-panel', 'archive-name', 'entries-body', 'btn-extract-all', 'btn-extract-folder', 'btn-test-archive',
+  'compress-panel', 'compress-list', 'format-select', 'level-select', 'password-input', 'btn-compress',
+  'downloads', 'install-btn', 'net-status', 'build-version', 'btn-clear',
+];
+
+const failures = [];
+let passed = 0;
+function check(name, fn) {
+  try { fn(); passed++; console.log(`ok   - ${name}`); }
+  catch (err) { failures.push(name); console.error(`FAIL - ${name}\n       ${err.message}`); }
+}
+
+// ---- helpers -------------------------------------------------------------
+function tagWithId(tag, id) {
+  const re = new RegExp(`<${tag}\\b[^>]*\\bid="${id}"[^>]*>`, 'i');
+  return re.exec(html);
+}
+function rangeOfTag(tag, idRe) {
+  // find opening tag (optionally by id), then match to its closing tag
+  const openRe = idRe
+    ? new RegExp(`<${tag}\\b[^>]*\\bid="${idRe}"[^>]*>`, 'i')
+    : new RegExp(`<${tag}\\b[^>]*>`, 'i');
+  const m = openRe.exec(html);
+  if (!m) return null;
+  const scan = new RegExp(`<${tag}\\b[^>]*>|</${tag}\\s*>`, 'gi');
+  scan.lastIndex = m.index + m[0].length;
+  let depth = 1, mm;
+  while ((mm = scan.exec(html))) {
+    if (mm[0][1] === '/') {
+      depth--;
+      if (depth === 0) return { start: m.index, end: mm.index + mm[0].length, open: m[0], inner: html.slice(m.index, mm.index + mm[0].length) };
+    } else if (!mm[0].endsWith('/>')) depth++;
+  }
+  return null;
+}
+function count(re) { return (html.match(re) || []).length; }
+
+// ---- structure -----------------------------------------------------------
+check('doctype + lang', () => {
+  assert.match(html, /^<!DOCTYPE html>\s*<html lang="en">/i);
+});
+
+check('exactly one <style> block, no external stylesheet', () => {
+  assert.equal(count(/<style\b/gi), 1);
+  assert.ok(!/<link[^>]+rel=["']?stylesheet/i.test(html), 'external stylesheet link found');
+});
+
+check('exactly one script tag: ./app.js with defer, no inline JS', () => {
+  assert.equal(count(/<script\b/gi), 1);
+  assert.match(html, /<script src="\.\/app\.js" defer><\/script>/);
+});
+
+check('no inline event handlers or javascript: URLs', () => {
+  for (const tag of html.match(/<[^>]+>/g) || []) {
+    assert.ok(!/\son[a-z]+\s*=/i.test(tag), `event handler in tag: ${tag.slice(0, 80)}`);
+  }
+  assert.ok(!/javascript:/i.test(html), 'javascript: URL found');
+});
+
+check('offline-safe: zero occurrences of "http" anywhere; no protocol-relative URLs', () => {
+  assert.ok(!/http/i.test(html), 'found an "http" substring');
+  assert.ok(!/(?:href|src)=["']\/\//i.test(html), 'protocol-relative URL found');
+});
+
+check('every href/src attribute is relative (starts with ./)', () => {
+  const refs = [...html.matchAll(/(?:href|src)="([^"]*)"/g)].map(m => m[1]);
+  assert.ok(refs.length >= 4, 'expected manifest/icon/apple-touch-icon/app.js references');
+  for (const r of refs) assert.ok(r.startsWith('./'), `not relative: ${r}`);
+});
+
+check('referenced local assets that must exist do exist', () => {
+  assert.ok(existsSync(`${ROOT}/icons/icon-32.png`));
+  assert.ok(existsSync(`${ROOT}/icons/icon-192.png`));
+});
+
+// ---- head -----------------------------------------------------------------
+check('head: charset + viewport + title', () => {
+  assert.match(html, /<meta charset="utf-8">/i);
+  assert.match(html, /<meta name="viewport" content="[^"]*width=device-width/);
+  assert.match(html, /<title>[^<]+<\/title>/);
+});
+
+check('head: description meta exact text', () => {
+  const m = /<meta name="description" content="([^"]*)"/.exec(html);
+  assert.ok(m, 'description meta missing');
+  assert.equal(m[1], '7-Zip running entirely in your browser via WebAssembly — compress, extract and inspect archives offline, no uploads');
+});
+
+check('head: exactly one theme-color = #111111 (matches manifest contract)', () => {
+  assert.equal(count(/name="theme-color"/g), 1);
+  assert.match(html, /<meta name="theme-color" content="#111111">/);
+});
+
+check('head: manifest, favicon, apple-touch-icon links', () => {
+  assert.match(html, /<link rel="manifest" href="\.\/manifest\.webmanifest">/);
+  assert.match(html, /<link rel="icon"[^>]*href="\.\/icons\/icon-32\.png">/);
+  assert.match(html, /<link rel="apple-touch-icon"[^>]*href="\.\/icons\/icon-192\.png">/);
+  const rels = [...html.matchAll(/<link[^>]*rel="([^"]+)"/g)].map(m => m[1]);
+  for (const rel of rels) {
+    assert.ok(['manifest', 'icon', 'apple-touch-icon'].includes(rel), `unexpected link rel: ${rel}`);
+  }
+});
+
+check('dark + light themes via prefers-color-scheme', () => {
+  assert.match(html, /@media \(prefers-color-scheme: light\)/);
+  assert.match(html, /color-scheme: dark light/);
+});
+
+// ---- DOM ID contract -------------------------------------------------------
+check('all 22 contract ids defined exactly once, no extra ids', () => {
+  const found = [...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]);
+  assert.equal(EXPECTED_IDS.length, 22, 'contract id list must hold 22 ids');
+  for (const id of EXPECTED_IDS) {
+    assert.equal(found.filter(x => x === id).length, 1, `id "${id}" must appear exactly once`);
+  }
+  const extras = found.filter(x => !EXPECTED_IDS.includes(x));
+  assert.deepEqual(extras, [], 'extra ids defined');
+});
+
+check('#dropzone present with exact instruction text; #file-input type=file multiple hidden', () => {
+  const dz = tagWithId('div', 'dropzone');
+  assert.ok(dz, 'dropzone div missing');
+  assert.ok(html.includes('Drop an archive to inspect/extract, or drop files to compress'), 'instruction text missing');
+  const fi = tagWithId('input', 'file-input');
+  assert.ok(fi, 'file-input missing');
+  assert.match(fi[0], /type="file"/);
+  assert.match(fi[0], /\bmultiple\b/);
+  assert.match(fi[0], /\bhidden\b/);
+});
+
+// ---- PWA file handling additions (native pickers) --------------------------
+check('#btn-open-archive: hidden .btn inside a .dz-actions row after #file-input, in the dropzone section', () => {
+  const sec = /<section aria-label="File drop zone">([\s\S]*?)<\/section>/.exec(html);
+  assert.ok(sec, 'dropzone section missing');
+  const inner = sec[1];
+  assert.ok(inner.includes('<div id="dropzone"'), 'dropzone div missing from its section');
+  const fiIdx = inner.indexOf('<input id="file-input"');
+  const dzIdx = inner.indexOf('<p class="dz-actions">');
+  assert.ok(fiIdx >= 0, '#file-input missing from the dropzone section');
+  assert.ok(dzIdx >= 0, 'no <p class="dz-actions"> row in the dropzone section');
+  assert.ok(dzIdx > fiIdx, '.dz-actions must follow the #file-input line');
+  const row = /<p class="dz-actions">([\s\S]*?)<\/p>/.exec(inner);
+  assert.ok(row, '.dz-actions paragraph is not closed');
+  assert.ok(row[1].includes('id="btn-open-archive"'), 'btn-open-archive is not inside .dz-actions');
+  const btn = tagWithId('button', 'btn-open-archive');
+  assert.ok(btn, 'btn-open-archive button missing');
+  assert.match(btn[0], /type="button"/);
+  assert.match(btn[0], /\bhidden\b/, 'must ship hidden — app.js unhides it only when showOpenFilePicker exists');
+  assert.match(btn[0], /class="btn"/);
+  assert.match(btn[0], /aria-label="[^"]{10,}"/);
+});
+
+check('#btn-extract-folder: hidden .btn between #btn-extract-all and #btn-test-archive in .panel-actions', () => {
+  const panel = rangeOfTag('section', 'archive-panel');
+  assert.ok(panel, 'archive-panel section missing');
+  const actions = /<div class="panel-actions">([\s\S]*?)<\/div>/.exec(panel.inner);
+  assert.ok(actions, '.panel-actions missing inside archive-panel');
+  const all = actions[1].indexOf('id="btn-extract-all"');
+  const folder = actions[1].indexOf('id="btn-extract-folder"');
+  const test = actions[1].indexOf('id="btn-test-archive"');
+  assert.ok(all >= 0 && folder >= 0 && test >= 0, 'all three action buttons must live in .panel-actions');
+  assert.ok(all < folder && folder < test, 'order must be: Extract all, Extract to folder…, Test archive');
+  const btn = tagWithId('button', 'btn-extract-folder');
+  assert.ok(btn, 'btn-extract-folder button missing');
+  assert.match(btn[0], /type="button"/);
+  assert.match(btn[0], /\bhidden\b/, 'must ship hidden — app.js unhides it only when showDirectoryPicker exists');
+  assert.match(btn[0], /class="btn"/);
+  assert.match(btn[0], /aria-label="[^"]{10,}"/);
+});
+
+check('CSS: .dz-actions + .download-row/.btn-save-as rules live in the single inline <style> block', () => {
+  const style = /<style>([\s\S]*?)<\/style>/.exec(html);
+  assert.ok(style, 'no <style> block');
+  assert.match(style[1], /\.dz-actions\s*\{[^}]*text-align:\s*center/);
+  assert.match(style[1], /#downloads\s+\.download-row\s*\{[^}]*display:\s*flex/);
+  assert.match(style[1], /\.download-row\s+a\s*\{[^}]*flex:\s*1 1 auto/);
+  assert.match(style[1], /\.btn-save-as\s*\{/);
+  assert.ok(!/<link[^>]+stylesheet/i.test(html), 'external stylesheet link found');
+});
+
+check('#status-line present; #progress-output is a <pre>', () => {
+  assert.ok(html.includes('id="status-line"'));
+  assert.ok(tagWithId('pre', 'progress-output'), 'progress-output must be a <pre>');
+});
+
+check('#archive-panel is a hidden <section> containing name/table/buttons', () => {
+  const panel = rangeOfTag('section', 'archive-panel');
+  assert.ok(panel, 'archive-panel section missing');
+  assert.match(panel.open, /\bhidden\b/);
+  for (const id of ['archive-name', 'entries-body', 'btn-extract-all', 'btn-extract-folder', 'btn-test-archive']) {
+    assert.ok(panel.inner.includes(`id="${id}"`), `${id} not inside archive-panel`);
+  }
+  assert.ok(panel.inner.includes('<table'), 'no table inside archive-panel');
+  assert.ok(tagWithId('tbody', 'entries-body'), 'entries-body must be a <tbody>');
+  assert.ok(panel.inner.indexOf('<thead') < panel.inner.indexOf('<tbody'), 'thead must precede tbody');
+  const ths = [...panel.inner.matchAll(/<th[^>]*>([^<]*)<\/th>/g)].map(m => m[1].trim());
+  assert.deepEqual(ths, ['Name', 'Size', 'Modified', 'Method']);
+  assert.ok(tagWithId('button', 'btn-extract-all') && tagWithId('button', 'btn-extract-folder') && tagWithId('button', 'btn-test-archive'));
+});
+
+check('#compress-panel is a hidden <section> containing list/selects/password/button', () => {
+  const panel = rangeOfTag('section', 'compress-panel');
+  assert.ok(panel, 'compress-panel section missing');
+  assert.match(panel.open, /\bhidden\b/);
+  for (const id of ['compress-list', 'format-select', 'level-select', 'password-input', 'btn-compress']) {
+    assert.ok(panel.inner.includes(`id="${id}"`), `${id} not inside compress-panel`);
+  }
+  assert.ok(tagWithId('ul', 'compress-list'), 'compress-list must be a <ul>');
+  assert.ok(tagWithId('button', 'btn-compress'), 'btn-compress must be a <button>');
+  const pw = tagWithId('input', 'password-input');
+  assert.match(pw[0], /type="password"/);
+});
+
+check('#format-select options are 7z and zip', () => {
+  const sel = rangeOfTag('select', 'format-select');
+  assert.ok(sel, 'format-select missing');
+  const opts = [...sel.inner.matchAll(/<option[^>]*value="([^"]*)"[^>]*>/g)].map(m => m[1]);
+  assert.deepEqual(opts, ['7z', 'zip']);
+});
+
+check('#level-select options 0,1,3,5,7,9 with default 5', () => {
+  const sel = rangeOfTag('select', 'level-select');
+  assert.ok(sel, 'level-select missing');
+  const opts = [...sel.inner.matchAll(/<option([^>]*)>/g)].map(m => m[1]);
+  const values = opts.map(a => /value="([^"]*)"/.exec(a)[1]);
+  assert.deepEqual(values, ['0', '1', '3', '5', '7', '9']);
+  assert.equal(opts.filter(a => /\bselected\b/.test(a)).length, 1, 'exactly one selected option');
+  assert.match(sel.inner, /<option value="5" selected>/);
+});
+
+check('#downloads container present', () => {
+  assert.ok(tagWithId('div', 'downloads'), 'downloads div missing');
+});
+
+check('#install-btn, #net-status, #build-version live in the header area', () => {
+  const header = rangeOfTag('header', null);
+  assert.ok(header, 'no <header> element');
+  for (const id of ['install-btn', 'net-status', 'build-version']) {
+    assert.ok(header.inner.includes(`id="${id}"`), `${id} not inside header`);
+  }
+  const install = tagWithId('button', 'install-btn');
+  assert.match(install[0], /\bhidden\b/, 'install-btn must start hidden');
+  assert.ok(tagWithId('span', 'net-status'), 'net-status must be a <span>');
+  assert.ok(tagWithId('span', 'build-version'), 'build-version must be a <span>');
+  assert.match(html, /<span id="build-version">local<\/span>/);
+});
+
+check('#btn-clear is a button', () => {
+  assert.ok(tagWithId('button', 'btn-clear'), 'btn-clear must be a <button>');
+});
+
+check('all buttons have type="button"', () => {
+  for (const id of ['install-btn', 'btn-clear', 'btn-extract-all', 'btn-extract-folder', 'btn-open-archive', 'btn-test-archive', 'btn-compress']) {
+    const tag = tagWithId('button', id);
+    assert.ok(tag, `${id} missing`);
+    assert.match(tag[0], /type="button"/, `${id} lacks type="button"`);
+  }
+});
+
+// ---- text content -----------------------------------------------------------
+check('noscript message present', () => {
+  const m = /<noscript>([\s\S]*?)<\/noscript>/.exec(html);
+  assert.ok(m, 'noscript missing');
+  assert.ok(m[1].replace(/\s+/g, ' ').trim().length > 40, 'noscript empty');
+});
+
+check('exact footer text', () => {
+  const normalized = html.replace(/\s+/g, ' ');
+  assert.ok(normalized.includes('7-Zip is (c) 1999-2026 Igor Pavlov. This site runs it entirely in your browser via WebAssembly — your files never leave your device.'), 'footer text mismatch');
+});
+
+// ---- summary ------------------------------------------------------------------
+console.log(`\n${passed} passed, ${failures.length} failed`);
+if (failures.length) { console.error('Failed checks:', failures.join('; ')); process.exit(1); }
+console.log('ALL INDEX.HTML CONTRACT CHECKS PASSED');

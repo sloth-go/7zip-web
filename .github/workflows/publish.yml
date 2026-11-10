@@ -174,7 +174,7 @@ jobs:
             --exclude='README.md' \
             --exclude='7zip' --exclude='wasm' --exclude='wasm-stage' \
             --exclude='site-publish' --exclude='node_modules' \
-            --exclude='emsdk-cache' --exclude='shim.o' \
+            --exclude='emsdk-cache' --exclude='shim.o' --exclude='tests' \
             ./ site-publish/
           mkdir -p site-publish/wasm
           cp wasm-stage/7zz.js wasm-stage/7zz.wasm site-publish/wasm/

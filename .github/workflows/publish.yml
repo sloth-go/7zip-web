@@ -174,12 +174,24 @@ jobs:
             --exclude='README.md' \
             --exclude='7zip' --exclude='wasm' --exclude='wasm-stage' \
             --exclude='site-publish' --exclude='node_modules' \
+            --exclude='emsdk-cache' --exclude='shim.o' \
             ./ site-publish/
           mkdir -p site-publish/wasm
           cp wasm-stage/7zz.js wasm-stage/7zz.wasm site-publish/wasm/
           cp wasm-stage/build-info.json site-publish/
           echo "--- site-publish ---"
           find site-publish -type f | sort
+          # Guard: the site is a handful of files + ~2 MB of wasm. If a CI
+          # working directory (toolchain cache, source checkout, ...) ever
+          # leaks past the excludes above, fail here instead of uploading
+          # gigabytes to Pages.
+          FILES=$(find site-publish -type f | wc -l)
+          SIZE_MB=$(du -sm site-publish | cut -f1)
+          if [ "$FILES" -gt 60 ] || [ "$SIZE_MB" -gt 60 ]; then
+            echo "::error::site-publish looks wrong: $FILES files, ${SIZE_MB} MB (expected <=60 files, <=60 MB)"
+            find site-publish -maxdepth 1 | sort
+            exit 1
+          fi
 
       - name: Generate service worker asset list
         run: |

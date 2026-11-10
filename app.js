@@ -21,6 +21,11 @@
   ];
   var MAX_PROGRESS_LINES = 200;
 
+  // Pinned base labels of the two selection buttons — updateSelectionUI()
+  // appends ' (N)' while the selection is non-empty.
+  var LABEL_EXTRACT_SELECTED = 'Extract selected';
+  var LABEL_SELECTED_TO_FOLDER = 'Selected to folder…';
+
   // MIME type -> extensions map for the native pickers. Must cover exactly
   // the ARCHIVE_EXTS list above and mirror the manifest file_handlers entry
   // (extensions WITH the leading dot, per the picker/manifest specs).
@@ -57,6 +62,9 @@
 
   var queuedFiles = []; // { path, name, size, data: ArrayBuffer } for compress
   var currentArchive = null; // { name, data: ArrayBuffer } currently opened
+  var currentEntries = []; // entries rendered by the last renderEntries call
+  var selectedPaths = new Set(); // entry.path strings the user checked
+  var entryCheckboxes = []; // row checkbox elements built by the last render
   var objectUrls = []; // kept alive until Clear
   var progressLines = [];
   var deferredInstallPrompt = null;
@@ -69,6 +77,7 @@
   // ------------------------------------------------------------------- dom ---
   var dropzone, fileInput, statusLine, progressOutput, btnOpenArchive;
   var archivePanel, archiveNameEl, entriesBody, btnExtractAll, btnExtractFolder, btnTestArchive;
+  var entrySelectAll, btnExtractSelected, btnExtractSelectedFolder;
   var compressPanel, compressList, formatSelect, levelSelect, passwordInput, btnCompress;
   var downloadsEl, installBtn, netStatus, buildVersion, btnClear;
   var initialStatusText = '';
@@ -311,12 +320,25 @@
 
   function openArchive(file) {
     var gen = generation;
+    // The currentArchive object THIS open owns. A second openArchive with no
+    // Clear in between leaves `generation` unchanged, so the gen guard alone
+    // cannot tell a superseded open from the current one — and bumping the
+    // generation here would silently kill unrelated in-flight jobs (e.g. a
+    // compress download). The owned guard keeps a superseded chain from
+    // rendering into, clearing, or erroring over the NEWER archive's table.
+    var owned = null;
     setStatus('Reading "' + file.name + '"…');
     file
       .arrayBuffer()
       .then(function (data) {
         if (gen !== generation) return null;
         currentArchive = { name: file.name, data: data };
+        owned = currentArchive;
+        // The archive just changed hands: drop the PREVIOUS archive's rows
+        // and checked selection NOW, before the new listing arrives.
+        // Otherwise stale checked rows survive the swap and "Extract
+        // selected" would apply the old selection to the new archive's bytes.
+        renderEntries([]);
         archiveNameEl.textContent = file.name;
         archivePanel.hidden = false;
         // Mixed drop: an archive opens while other files queue for compress —
@@ -329,6 +351,7 @@
       })
       .then(function (res) {
         if (gen !== generation || !res) return;
+        if (owned !== currentArchive) return; // superseded by a newer open
         renderEntries(res.entries || []);
         setStatus(
           '"' + currentArchive.name + '": ' + (res.entries || []).length + ' entries listed'
@@ -336,17 +359,65 @@
       })
       .catch(function (err) {
         if (gen !== generation) return;
+        // A superseded open must not clear or error over the newer table.
+        // owned === null: the swap never happened (e.g. arrayBuffer failed) —
+        // keep the original clear-and-report behavior.
+        if (owned !== null && owned !== currentArchive) return;
         renderEntries([]);
         setStatus(err && err.message ? err.message : String(err), true);
       });
   }
 
   function renderEntries(entries) {
+    // Reset the selection state on every render: the checkboxes, the
+    // selected-path set and the cached checkbox list all belong to THIS list.
+    currentEntries = entries.slice();
+    selectedPaths = new Set();
+    entryCheckboxes = [];
     entriesBody.textContent = '';
     var frag = document.createDocumentFragment();
     entries.forEach(function (entry) {
       var tr = document.createElement('tr');
       if (entry.isFolder) tr.className = 'folder';
+
+      // Checkbox column first; folders are selectable too (a selected
+      // directory extracts its whole subtree). The change listener closes
+      // over `entry` directly — the DOM contract offers neither dataset
+      // attributes nor querySelectorAll.
+      var tdSelect = document.createElement('td');
+      tdSelect.className = 'col-select';
+      var checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'entry-select';
+      checkbox.setAttribute('aria-label', 'Select ' + entry.path);
+      checkbox.addEventListener('change', function () {
+        if (checkbox.checked) {
+          selectedPaths.add(entry.path);
+        } else {
+          // A listing MAY contain duplicate paths (legal in e.g. zip). The
+          // Set is keyed by path, so unchecking ONE row must not drop the
+          // shared key while another row with the same path is still checked
+          // — otherwise the UI (a checked row) and the extract payload (path
+          // missing) diverge. entryCheckboxes is index-aligned with
+          // currentEntries; scan it instead of querying the DOM.
+          var stillClaimed = false;
+          for (var k = 0; k < entryCheckboxes.length; k++) {
+            if (entryCheckboxes[k] === checkbox) continue;
+            if (
+              entryCheckboxes[k].checked &&
+              currentEntries[k] &&
+              currentEntries[k].path === entry.path
+            ) {
+              stillClaimed = true;
+              break;
+            }
+          }
+          if (!stillClaimed) selectedPaths.delete(entry.path);
+        }
+        updateSelectionUI();
+      });
+      tdSelect.appendChild(checkbox);
+      entryCheckboxes.push(checkbox);
 
       var tdName = document.createElement('td');
       tdName.textContent = entry.isFolder ? entry.path + '/' : entry.path;
@@ -361,6 +432,7 @@
       var tdMethod = document.createElement('td');
       tdMethod.textContent = entry.method || '';
 
+      tr.appendChild(tdSelect);
       tr.appendChild(tdName);
       tr.appendChild(tdSize);
       tr.appendChild(tdModified);
@@ -370,12 +442,38 @@
     if (!entries.length) {
       var trEmpty = document.createElement('tr');
       var tdEmpty = document.createElement('td');
-      tdEmpty.colSpan = 4;
+      tdEmpty.colSpan = 5;
       tdEmpty.textContent = '(no entries)';
       trEmpty.appendChild(tdEmpty);
       frag.appendChild(trEmpty);
     }
     entriesBody.appendChild(frag);
+    updateSelectionUI();
+  }
+
+  // Selection-derived UI, computed ONLY from selectedPaths and the
+  // entryCheckboxes array (never DOM queries): button enablement + counted
+  // labels, and the select-all checked/indeterminate state.
+  function updateSelectionUI() {
+    var n = selectedPaths.size;
+    var suffix = n > 0 ? ' (' + n + ')' : '';
+    if (btnExtractSelected) {
+      btnExtractSelected.disabled = n === 0;
+      btnExtractSelected.textContent = LABEL_EXTRACT_SELECTED + suffix;
+    }
+    if (btnExtractSelectedFolder) {
+      btnExtractSelectedFolder.disabled = n === 0;
+      btnExtractSelectedFolder.textContent = LABEL_SELECTED_TO_FOLDER + suffix;
+    }
+    if (entrySelectAll) {
+      var total = entryCheckboxes.length;
+      var checked = 0;
+      for (var i = 0; i < total; i++) {
+        if (entryCheckboxes[i].checked) checked++;
+      }
+      entrySelectAll.checked = n > 0 && checked === total;
+      entrySelectAll.indeterminate = checked > 0 && checked < total;
+    }
   }
 
   function queueFilesForCompress(files) {
@@ -681,6 +779,95 @@
     );
   }
 
+  // Deterministic request order for the selection (Set iteration is insertion
+  // order; sorting keeps repeated extractions of the same selection equal).
+  function selectedPathsList() {
+    return Array.from(selectedPaths).sort();
+  }
+
+  // Extract ONLY the checked entries as downloads. Same request shape as
+  // onExtractAll plus the worker protocol's OPTIONAL 'paths' field — never
+  // 'files': pumpQueue treats msg.files as transferable binary payloads.
+  function onExtractSelected() {
+    if (!currentArchive) return;
+    if (selectedPaths.size === 0) return; // defense-in-depth (button also disabled)
+    var gen = generation;
+    var paths = selectedPathsList();
+    var n = paths.length;
+    setStatus(
+      'Extracting ' + n + ' selected ' + (n === 1 ? 'entry' : 'entries') +
+        ' from "' + currentArchive.name + '"…'
+    );
+    sendRequest('extract', {
+      archive: { name: currentArchive.name, data: currentArchive.data },
+      password: currentPassword(),
+      paths: paths,
+    }).then(
+      function (res) {
+        if (gen !== generation) return;
+        var files = res.files || [];
+        files.forEach(function (f) {
+          addDownload(f.path, f.data);
+        });
+        if (files.length > 0) {
+          setStatus('Extracted ' + files.length + ' file(s) from "' + currentArchive.name + '"');
+        } else {
+          setStatus(
+            'Nothing extracted from the ' + n + ' selected ' + (n === 1 ? 'entry' : 'entries'),
+            true
+          );
+        }
+      },
+      function (err) {
+        if (gen !== generation) return;
+        setStatus(err && err.message ? err.message : String(err), true);
+      }
+    );
+  }
+
+  // Extract ONLY the checked entries into a user-chosen directory. The picker
+  // call MUST happen synchronously inside the click handler (transient user
+  // activation) — nothing is awaited before it. Deliberately adds nothing to
+  // the downloads list; the files land on the real file system.
+  function onExtractSelectedToFolder() {
+    if (!currentArchive) return;
+    if (selectedPaths.size === 0) return; // defense-in-depth (button also disabled)
+    var gen = generation;
+    var paths = selectedPathsList();
+    var n = paths.length;
+    window
+      .showDirectoryPicker({ mode: 'readwrite', id: '7zip-extract-selected', startIn: 'downloads' })
+      .then(function (dirHandle) {
+        if (gen !== generation) return null;
+        setStatus(
+          'Extracting ' + n + ' selected ' + (n === 1 ? 'entry' : 'entries') +
+            ' from "' + currentArchive.name + '" to folder…'
+        );
+        return sendRequest('extract', {
+          archive: { name: currentArchive.name, data: currentArchive.data },
+          password: currentPassword(),
+          paths: paths,
+        }).then(function (res) {
+          if (gen !== generation) return null;
+          return writeFilesToDirectory(dirHandle, res.files || []);
+        });
+      })
+      .then(function (result) {
+        if (gen !== generation || !result) return;
+        setStatus(
+          result.failed
+            ? 'Extracted ' + result.written + ' file(s); ' + result.failed + ' could not be written'
+            : 'Extracted ' + result.written + ' file(s) to the chosen folder',
+          !!result.failed
+        );
+      })
+      .catch(function (err) {
+        if (gen !== generation) return;
+        if (err && err.name === 'AbortError') return; // dismissed or permission denied
+        setStatus(err && err.message ? err.message : String(err), true);
+      });
+  }
+
   function onCompress() {
     if (!queuedFiles.length) {
       setStatus('Nothing to compress — drop some files first', true);
@@ -940,6 +1127,9 @@
     btnExtractAll = $('btn-extract-all');
     btnExtractFolder = $('btn-extract-folder');
     btnTestArchive = $('btn-test-archive');
+    entrySelectAll = $('entry-select-all');
+    btnExtractSelected = $('btn-extract-selected');
+    btnExtractSelectedFolder = $('btn-extract-selected-folder');
     compressPanel = $('compress-panel');
     compressList = $('compress-list');
     formatSelect = $('format-select');
@@ -964,9 +1154,26 @@
     consumeSharedFiles();
 
     btnExtractAll.addEventListener('click', onExtractAll);
+    btnExtractSelected.addEventListener('click', onExtractSelected);
     btnTestArchive.addEventListener('click', onTestArchive);
     btnCompress.addEventListener('click', onCompress);
     btnClear.addEventListener('click', onClear);
+
+    // Select-all header checkbox: mirror it onto every row checkbox and
+    // rebuild the selection set from currentEntries (folders included).
+    entrySelectAll.addEventListener('change', function () {
+      var on = !!entrySelectAll.checked;
+      selectedPaths.clear();
+      for (var i = 0; i < entryCheckboxes.length; i++) {
+        entryCheckboxes[i].checked = on;
+      }
+      if (on) {
+        currentEntries.forEach(function (entry) {
+          selectedPaths.add(entry.path);
+        });
+      }
+      updateSelectionUI();
+    });
 
     // Native pickers are feature-detected: on browsers without them (Firefox,
     // Safari) the buttons stay hidden and the dropzone / download links remain
@@ -978,6 +1185,8 @@
     if (typeof window.showDirectoryPicker === 'function') {
       btnExtractFolder.addEventListener('click', onExtractToFolder);
       btnExtractFolder.hidden = false;
+      btnExtractSelectedFolder.addEventListener('click', onExtractSelectedToFolder);
+      btnExtractSelectedFolder.hidden = false;
     }
 
     updateNetStatus();

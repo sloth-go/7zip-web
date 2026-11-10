@@ -29,6 +29,13 @@
  *       success status; AbortError silent; errors surface
  *   (7) generation: Clear mid-extract rejects the flow — zero writes to the
  *       directory handle and no status set after Clear
+ *   (8) selective extraction: every row (folders included) carries a leading
+ *       td.col-select checkbox; button labels/enablement and the select-all
+ *       checked/indeterminate states derive from the selection; Extract
+ *       selected sends the SORTED paths as the worker's optional 'paths'
+ *       field (never 'files') — as downloads or through the synchronously
+ *       called directory picker; pinned status strings; empty selection is a
+ *       no-op; Clear mid-flight and Clear-with-selection guards
  *
  * Usage: node tests/app-file-handling.test.mjs   (from the repo root)
  */
@@ -193,9 +200,12 @@ const ID_TABLE = {
   'btn-open-archive': { tag: 'button', hiddenFromHtml: true },
   'archive-panel': { tag: 'section' },
   'archive-name': { tag: 'span' },
+  'entry-select-all': { tag: 'input' },
   'entries-body': { tag: 'tbody' },
   'btn-extract-all': { tag: 'button' },
+  'btn-extract-selected': { tag: 'button' },
   'btn-extract-folder': { tag: 'button', hiddenFromHtml: true },
+  'btn-extract-selected-folder': { tag: 'button', hiddenFromHtml: true },
   'btn-test-archive': { tag: 'button' },
   'compress-panel': { tag: 'section' },
   'compress-list': { tag: 'ul' },
@@ -1323,6 +1333,412 @@ section('(7) Clear during extract-to-folder cancels every write');
       order: fakeDir.log.order,
       status: world.status()
     }));
+}
+
+/* ==================================== (8) selective extraction ============= */
+
+section('(8) selective extraction (checkbox column, selection UI, paths flows)');
+
+// One folder + two files, deliberately NOT in sorted order so the request's
+// sorted-paths contract is observable.
+const SEL_ENTRIES = [
+  { path: 'docs', size: 0, modified: '2026-01-01 00:00', method: '', isFolder: true, encrypted: false },
+  { path: 'b.txt', size: 3, modified: '2026-01-02 03:04', method: 'LZMA2', isFolder: false, encrypted: false },
+  { path: 'a.txt', size: 5, modified: '2026-01-02 03:05', method: 'LZMA2', isFolder: false, encrypted: false }
+];
+
+// Row checkboxes are reached through the stub tree (NO querySelectorAll, NO
+// dataset — the render contract offers neither): tbody > tr > td.col-select > input.
+function selRowBox(world, rowIndex) {
+  const tr = world.byId['entries-body'].children[rowIndex];
+  return tr && tr.children[0] && tr.children[0].children[0];
+}
+function selToggle(world, box, on) {
+  box.checked = on;
+  world.fire(box, 'change');
+}
+
+{
+  // No picker globals: the download-path button is always wired; the folder
+  // variant stays hidden and unwired.
+  const world = createAppWorld().load();
+
+  check('(8a) #btn-extract-selected ships visible, #btn-extract-selected-folder stays hidden without showDirectoryPicker',
+    world.byId['btn-extract-selected'].hidden === false &&
+    world.byId['btn-extract-selected-folder'].hidden === true);
+  check('(8a) #btn-extract-selected is always wired; the folder variant has no click handler without showDirectoryPicker',
+    (world.byId['btn-extract-selected'].listeners.get('click') || []).length === 1 &&
+    (world.byId['btn-extract-selected-folder'].listeners.get('click') || []).length === 0);
+
+  const ARC = enc.encode('selective-arc-bytes');
+  const listMsg = await openArchiveViaInput(world, 'test.7z', ARC, 'application/x-7z-compressed');
+  check('(8a) list request for test.7z reached the worker', !!listMsg);
+  world.reply({ id: listMsg.id, type: 'list-result', entries: SEL_ENTRIES });
+  check('(8a) archive opened: 3 entries listed',
+    await waitFor(() => world.status() === '"test.7z": 3 entries listed'),
+    'status=' + JSON.stringify(world.status()));
+
+  const rows = world.byId['entries-body'].children;
+  check('(8a) one row per entry', rows.length === 3, 'rows=' + rows.length);
+  check('(8a) EVERY row (folder included) prepends a td.col-select holding exactly one checkbox input.entry-select',
+    rows.length === 3 && rows.every((tr) => {
+      const td = tr.children[0];
+      return td && td.tagName === 'TD' && td.className === 'col-select' &&
+        td.children.length === 1 && td.children[0].tagName === 'INPUT' &&
+        td.children[0].type === 'checkbox' && td.children[0].className === 'entry-select';
+    }),
+    JSON.stringify(rows.map((tr) => tr.children.map((td) => td.tagName + '.' + td.className))));
+  check('(8a) each row checkbox aria-labels its own entry path and captured exactly one change listener',
+    rows.length === 3 && rows.every((tr, i) =>
+      tr.children[0].children[0].getAttribute('aria-label') === 'Select ' + SEL_ENTRIES[i].path &&
+      (tr.children[0].children[0].listeners.get('change') || []).length === 1),
+    JSON.stringify(rows.map((tr) => tr.children[0].children[0] && tr.children[0].children[0].getAttribute('aria-label'))));
+  check('(8a) every row has 5 cells (select + name/size/modified/method)',
+    rows.length === 3 && rows.every((tr) => tr.children.length === 5));
+
+  check('(8a) initial selection UI: both buttons disabled with the pinned base labels, select-all off',
+    world.byId['btn-extract-selected'].disabled === true &&
+    world.byId['btn-extract-selected'].textContent === 'Extract selected' &&
+    world.byId['btn-extract-selected-folder'].disabled === true &&
+    world.byId['btn-extract-selected-folder'].textContent === 'Selected to folder…' &&
+    !world.byId['entry-select-all'].checked && !world.byId['entry-select-all'].indeterminate,
+    JSON.stringify({
+      sel: world.byId['btn-extract-selected'].textContent,
+      selFolder: world.byId['btn-extract-selected-folder'].textContent,
+      disabled: [world.byId['btn-extract-selected'].disabled, world.byId['btn-extract-selected-folder'].disabled]
+    }));
+
+  selToggle(world, selRowBox(world, 1), true); // b.txt
+  check('(8a) checking one row flips disabled and appends " (1)" to BOTH pinned labels; select-all goes indeterminate',
+    world.byId['btn-extract-selected'].disabled === false &&
+    world.byId['btn-extract-selected'].textContent === 'Extract selected (1)' &&
+    world.byId['btn-extract-selected-folder'].disabled === false &&
+    world.byId['btn-extract-selected-folder'].textContent === 'Selected to folder… (1)' &&
+    world.byId['entry-select-all'].indeterminate === true &&
+    !world.byId['entry-select-all'].checked,
+    JSON.stringify([
+      world.byId['btn-extract-selected'].textContent,
+      world.byId['btn-extract-selected-folder'].textContent,
+      world.byId['entry-select-all'].indeterminate
+    ]));
+
+  selToggle(world, selRowBox(world, 2), true); // a.txt
+  check('(8a) a second checked row counts up to " (2)" on both labels',
+    world.byId['btn-extract-selected'].textContent === 'Extract selected (2)' &&
+    world.byId['btn-extract-selected-folder'].textContent === 'Selected to folder… (2)');
+
+  selToggle(world, selRowBox(world, 1), false); // uncheck b.txt again
+  check('(8a) unchecking a row counts back down to " (1)" and keeps select-all indeterminate',
+    world.byId['btn-extract-selected'].textContent === 'Extract selected (1)' &&
+    world.byId['btn-extract-selected-folder'].textContent === 'Selected to folder… (1)' &&
+    world.byId['entry-select-all'].indeterminate === true &&
+    !world.byId['entry-select-all'].checked);
+
+  const selectAll = world.byId['entry-select-all'];
+  selectAll.checked = true;
+  world.fire(selectAll, 'change');
+  check('(8a) select-all checks EVERY row (folder included), counts all 3 and clears indeterminate',
+    [0, 1, 2].every((i) => selRowBox(world, i).checked === true) &&
+    world.byId['btn-extract-selected'].textContent === 'Extract selected (3)' &&
+    world.byId['btn-extract-selected-folder'].textContent === 'Selected to folder… (3)' &&
+    selectAll.checked === true && selectAll.indeterminate === false,
+    JSON.stringify([0, 1, 2].map((i) => selRowBox(world, i).checked)));
+
+  // Extract the select-all selection: proves the folder path joined the set
+  // and that the request order is SORTED (docs, b.txt, a.txt -> a, b, docs).
+  world.click(world.byId['btn-extract-selected']);
+  check('(8a) click status is pinned: Extracting 3 selected entries from "test.7z"…',
+    world.status() === 'Extracting 3 selected entries from "test.7z"…' && !world.isError(),
+    'status=' + JSON.stringify(world.status()));
+  const selMsg = (await waitFor(() => world.workerMessages.some((m) => m.msg.type === 'extract')))
+    ? world.lastMsgOfType('extract') : null;
+  check('(8a) extract request paths are the SORTED selected paths, folders included',
+    !!selMsg && deepEq(selMsg.paths, ['a.txt', 'b.txt', 'docs']),
+    JSON.stringify(selMsg && selMsg.paths));
+  check('(8a) the selection travels as "paths", NEVER as "files" (pumpQueue would treat files as transferables)',
+    !!selMsg && selMsg.files === undefined && Array.isArray(selMsg.paths));
+  check('(8a) archive name + bytes ride along exactly like in the extract-all flow, password untouched',
+    !!selMsg && selMsg.archive.name === 'test.7z' &&
+    bytesEq(new Uint8Array(selMsg.archive.data), ARC) && selMsg.password === undefined);
+  world.reply({ id: selMsg.id, type: 'extract-result', files: [] });
+  check('(8a) zero files -> pinned plural error status "Nothing extracted from the 3 selected entries"',
+    await waitFor(() => world.status() === 'Nothing extracted from the 3 selected entries') && world.isError(),
+    'status=' + JSON.stringify(world.status()));
+
+  selToggle(world, selRowBox(world, 0), false); // uncheck docs
+  check('(8a) unchecking one row after select-all: labels count 2, select-all drops to indeterminate',
+    world.byId['btn-extract-selected'].textContent === 'Extract selected (2)' &&
+    world.byId['btn-extract-selected-folder'].textContent === 'Selected to folder… (2)' &&
+    selectAll.checked === false && selectAll.indeterminate === true);
+
+  selectAll.checked = false;
+  world.fire(selectAll, 'change');
+  check('(8a) select-all off unchecks every row, resets both labels to base and disables both buttons',
+    [0, 1, 2].every((i) => selRowBox(world, i).checked === false) &&
+    world.byId['btn-extract-selected'].disabled === true &&
+    world.byId['btn-extract-selected'].textContent === 'Extract selected' &&
+    world.byId['btn-extract-selected-folder'].disabled === true &&
+    world.byId['btn-extract-selected-folder'].textContent === 'Selected to folder…' &&
+    selectAll.checked === false && selectAll.indeterminate === false,
+    JSON.stringify([0, 1, 2].map((i) => selRowBox(world, i).checked)));
+
+  // Empty selection: the click handler must be a no-op even though the stub
+  // fires listeners regardless of `disabled` (defense-in-depth per contract).
+  const msgsBefore = world.workerMessages.length;
+  const statusBefore = world.status();
+  world.click(world.byId['btn-extract-selected']);
+  await tick(40);
+  check('(8a) empty selection: clicking Extract selected sends NO worker message and leaves the status untouched',
+    world.workerMessages.length === msgsBefore && world.status() === statusBefore,
+    'newMessages=' + (world.workerMessages.length - msgsBefore) + ' status=' + JSON.stringify(world.status()));
+
+  // Password + sorted paths + successful download flow.
+  world.byId['password-input'].value = 'hunter2';
+  selToggle(world, selRowBox(world, 1), true); // b.txt
+  selToggle(world, selRowBox(world, 2), true); // a.txt
+  world.click(world.byId['btn-extract-selected']);
+  check('(8a) two-entry click status is pinned plural: Extracting 2 selected entries from "test.7z"…',
+    world.status() === 'Extracting 2 selected entries from "test.7z"…' && !world.isError(),
+    'status=' + JSON.stringify(world.status()));
+  const sel2 = (await waitFor(() => world.msgOfType('extract').length >= 2))
+    ? world.lastMsgOfType('extract') : null;
+  check('(8a) second request carries sorted ["a.txt","b.txt"] and the typed password like the existing flow',
+    !!sel2 && deepEq(sel2.paths, ['a.txt', 'b.txt']) && sel2.password === 'hunter2' &&
+    sel2.archive.name === 'test.7z' && bytesEq(new Uint8Array(sel2.archive.data), ARC),
+    JSON.stringify(sel2 && { paths: sel2.paths, password: sel2.password }));
+  const DATA = { 'a.txt': new Uint8Array([1, 2, 3]), 'b.txt': new Uint8Array([4, 5]) };
+  world.reply({
+    id: sel2.id,
+    type: 'extract-result',
+    files: Object.keys(DATA).map((p) => ({ path: p, data: DATA[p] }))
+  });
+  check('(8a) both returned files appeared as download rows with their base names',
+    await waitFor(() => world.byId['downloads'].children.length === 2) &&
+    deepEq(world.byId['downloads'].children.map((row) => row.children[0].download).sort(), ['a.txt', 'b.txt']),
+    JSON.stringify(world.byId['downloads'].children.map((row) => row.children[0] && row.children[0].download)));
+  check('(8a) pinned success status: Extracted 2 file(s) from "test.7z" (not an error)',
+    world.status() === 'Extracted 2 file(s) from "test.7z"' && !world.isError(),
+    'status=' + JSON.stringify(world.status()));
+
+  // Singular pins: 1 selected entry, zero files returned.
+  selToggle(world, selRowBox(world, 2), false); // keep only b.txt
+  world.click(world.byId['btn-extract-selected']);
+  check('(8a) single-entry click status is pinned singular: Extracting 1 selected entry from "test.7z"…',
+    world.status() === 'Extracting 1 selected entry from "test.7z"…',
+    'status=' + JSON.stringify(world.status()));
+  const sel3 = (await waitFor(() => world.msgOfType('extract').length >= 3))
+    ? world.lastMsgOfType('extract') : null;
+  check('(8a) singular request carries exactly ["b.txt"]',
+    !!sel3 && deepEq(sel3.paths, ['b.txt']), JSON.stringify(sel3 && sel3.paths));
+  world.reply({ id: sel3.id, type: 'extract-result', files: [] });
+  check('(8a) zero files -> pinned singular error status "Nothing extracted from the 1 selected entry"',
+    await waitFor(() => world.status() === 'Nothing extracted from the 1 selected entry') && world.isError(),
+    'status=' + JSON.stringify(world.status()));
+
+  // Clear with an active selection resets the whole selection UI.
+  world.click(world.byId['btn-clear']);
+  check('(8a) Clear with a selection: base labels, both buttons disabled, select-all unchecked and not indeterminate',
+    world.byId['btn-extract-selected'].textContent === 'Extract selected' &&
+    world.byId['btn-extract-selected'].disabled === true &&
+    world.byId['btn-extract-selected-folder'].textContent === 'Selected to folder…' &&
+    world.byId['btn-extract-selected-folder'].disabled === true &&
+    world.byId['entry-select-all'].checked !== true &&
+    !world.byId['entry-select-all'].indeterminate,
+    JSON.stringify({
+      sel: world.byId['btn-extract-selected'].textContent,
+      selFolder: world.byId['btn-extract-selected-folder'].textContent,
+      checked: world.byId['entry-select-all'].checked,
+      indeterminate: world.byId['entry-select-all'].indeterminate
+    }));
+  const bodyAfterClear = world.byId['entries-body'];
+  check('(8a) Clear renders the empty listing: one "(no entries)" placeholder row with colSpan 5',
+    bodyAfterClear.children.length === 1 &&
+    bodyAfterClear.children[0].children.length === 1 &&
+    bodyAfterClear.children[0].children[0].colSpan === 5 &&
+    bodyAfterClear.children[0].children[0].textContent === '(no entries)',
+    JSON.stringify(bodyAfterClear.children.map((tr) => tr.children.map((td) => [td.colSpan, td.textContent]))));
+}
+
+{
+  // An empty list-result must render the 5-column placeholder directly.
+  const world = createAppWorld().load();
+  const listMsg = await openArchiveViaInput(world, 'empty.7z', enc.encode('nothing'), 'application/x-7z-compressed');
+  check('(8b) list request for empty.7z reached the worker', !!listMsg);
+  world.reply({ id: listMsg.id, type: 'list-result', entries: [] });
+  check('(8b) empty listing: "(no entries)" placeholder spans all 5 columns',
+    await waitFor(() => world.status() === '"empty.7z": 0 entries listed') &&
+    world.byId['entries-body'].children.length === 1 &&
+    world.byId['entries-body'].children[0].children[0].colSpan === 5 &&
+    world.byId['entries-body'].children[0].children[0].textContent === '(no entries)',
+    JSON.stringify(world.byId['entries-body'].children.map((tr) => tr.children.map((td) => [td.colSpan, td.textContent]))));
+  check('(8b) buttons keep the base labels and stay disabled after an empty listing',
+    world.byId['btn-extract-selected'].textContent === 'Extract selected' &&
+    world.byId['btn-extract-selected'].disabled === true &&
+    world.byId['btn-extract-selected-folder'].textContent === 'Selected to folder…' &&
+    world.byId['btn-extract-selected-folder'].disabled === true);
+}
+
+{
+  // Selected-to-folder flow with the directory picker present.
+  const fakeDir = makeFakeDir();
+  const world = createAppWorld({
+    pickers: { dir: () => Promise.resolve(fakeDir.handle) }
+  }).load();
+
+  check('(8c) boot() unhides #btn-extract-selected-folder when showDirectoryPicker exists and wires exactly one click handler',
+    world.byId['btn-extract-selected-folder'].hidden === false &&
+    (world.byId['btn-extract-selected-folder'].listeners.get('click') || []).length === 1);
+
+  const ARC = enc.encode('folder-arc-bytes');
+  const listMsg = await openArchiveViaInput(world, 'test.7z', ARC, 'application/x-7z-compressed');
+  check('(8c) archive opened before the selected-to-folder extract', !!listMsg);
+  world.reply({ id: listMsg.id, type: 'list-result', entries: SEL_ENTRIES });
+  await waitFor(() => world.status() === '"test.7z": 3 entries listed');
+
+  selToggle(world, selRowBox(world, 1), true); // b.txt
+  selToggle(world, selRowBox(world, 2), true); // a.txt
+  check('(8c) folder button counts the selection: "Selected to folder… (2)"',
+    world.byId['btn-extract-selected-folder'].textContent === 'Selected to folder… (2)' &&
+    world.byId['btn-extract-selected-folder'].disabled === false);
+
+  world.click(world.byId['btn-extract-selected-folder']);
+  check('(8c) showDirectoryPicker is called SYNCHRONOUSLY in the click handler',
+    world.pickerCalls.dir.length === 1);
+  check('(8c) directory picker options: mode readwrite, id 7zip-extract-selected, startIn downloads',
+    deepEq(world.pickerCalls.dir[0], { mode: 'readwrite', id: '7zip-extract-selected', startIn: 'downloads' }),
+    JSON.stringify(world.pickerCalls.dir[0]));
+
+  const gotExtract = await waitFor(() => world.workerMessages.some((m) => m.msg.type === 'extract'));
+  const msg = world.lastMsgOfType('extract');
+  check('(8c) extract request carries the sorted selection paths, archive bytes and no files field',
+    gotExtract && deepEq(msg.paths, ['a.txt', 'b.txt']) && msg.files === undefined &&
+    msg.archive.name === 'test.7z' && bytesEq(new Uint8Array(msg.archive.data), ARC) &&
+    msg.password === undefined,
+    JSON.stringify(msg && msg.paths));
+  check('(8c) status is the pinned "to folder" variant',
+    world.status() === 'Extracting 2 selected entries from "test.7z" to folder…',
+    JSON.stringify(world.status()));
+
+  const DATA = { 'a.txt': new Uint8Array([9, 8, 7]), 'b.txt': new Uint8Array([6, 5]) };
+  world.reply({
+    id: msg.id,
+    type: 'extract-result',
+    files: Object.keys(DATA).map((p) => ({ path: p, data: DATA[p] }))
+  });
+  check('(8c) success status: Extracted 2 file(s) to the chosen folder (not an error)',
+    await waitFor(() => world.status() === 'Extracted 2 file(s) to the chosen folder') && !world.isError(),
+    'status=' + JSON.stringify(world.status()));
+  check('(8c) both selected files were written through the fake directory handle with exact bytes',
+    fakeDir.log.writes.length === 2 &&
+    fakeDir.log.writes.every((w) => DATA[w.path] !== undefined && bytesEq(w.bytes, DATA[w.path])) &&
+    deepEq(fakeDir.log.writes.map((w) => w.path).sort(), ['a.txt', 'b.txt']),
+    JSON.stringify(fakeDir.log.writes.map((w) => [w.path, [...w.bytes]])));
+  check('(8c) selected-to-folder added NOTHING to the downloads list',
+    world.byId['downloads'].children.length === 0);
+
+  // Partial write failure mirrors the extract-all-to-folder status contract.
+  world.click(world.byId['btn-extract-selected-folder']);
+  const msg2 = (await waitFor(() => world.msgOfType('extract').length >= 2))
+    ? world.lastMsgOfType('extract') : null;
+  check('(8c) a second click re-sends the same sorted selection',
+    !!msg2 && deepEq(msg2.paths, ['a.txt', 'b.txt']));
+  world.reply({
+    id: msg2.id,
+    type: 'extract-result',
+    files: [
+      { path: 'a.txt', data: new Uint8Array([1]) },
+      { path: 'broken.txt' } // no data -> counts as unwritable
+    ]
+  });
+  check('(8c) partial failure reports "Extracted 1 file(s); 1 could not be written" as an error',
+    await waitFor(() => world.status() === 'Extracted 1 file(s); 1 could not be written') && world.isError(),
+    'status=' + JSON.stringify(world.status()));
+}
+
+{
+  // Selected-to-folder picker dismissal vs failure (mirrors the (5d) contract).
+  let rejectWith = null;
+  const world = createAppWorld({ pickers: { dir: () => Promise.reject(rejectWith) } }).load();
+  const listMsg = await openArchiveViaInput(world, 'test.7z', enc.encode('arc'), 'application/x-7z-compressed');
+  world.reply({ id: listMsg.id, type: 'list-result', entries: SEL_ENTRIES });
+  await waitFor(() => world.status().includes('entries listed'));
+  selToggle(world, selRowBox(world, 2), true); // a.txt
+  const statusBefore = world.status();
+
+  const abort = new Error('dismissed');
+  abort.name = 'AbortError';
+  rejectWith = abort;
+  world.click(world.byId['btn-extract-selected-folder']);
+  await tick(50);
+  check('(8d) AbortError from the selected-folder picker is silent',
+    world.status() === statusBefore && !world.isError(),
+    'status=' + JSON.stringify(world.status()));
+
+  rejectWith = new Error('no directory access');
+  world.click(world.byId['btn-extract-selected-folder']);
+  check('(8d) a failed selected-folder picker surfaces the error message',
+    await waitFor(() => world.status() === 'no directory access') && world.isError(),
+    'status=' + JSON.stringify(world.status()));
+  check('(8d) rejected pickers never sent an extract request',
+    world.workerMessages.filter((m) => m.msg.type === 'extract').length === 0);
+}
+
+{
+  // Clear mid-flight for BOTH selected-extraction flows: the late worker
+  // reply must hit the void (generation guard).
+  const fakeDir = makeFakeDir();
+  const world = createAppWorld({
+    pickers: { dir: () => Promise.resolve(fakeDir.handle) }
+  }).load();
+
+  // Downloads flow.
+  let listMsg = await openArchiveViaInput(world, 'test.7z', enc.encode('arc'), 'application/x-7z-compressed');
+  world.reply({ id: listMsg.id, type: 'list-result', entries: SEL_ENTRIES });
+  await waitFor(() => world.status().includes('entries listed'));
+  selToggle(world, selRowBox(world, 1), true); // b.txt
+  selToggle(world, selRowBox(world, 2), true); // a.txt
+  world.click(world.byId['btn-extract-selected']);
+  const gotExtract = await waitFor(() => world.workerMessages.some((m) => m.msg.type === 'extract'));
+  check('(8e) extract-selected request is in flight before Clear', gotExtract);
+  world.click(world.byId['btn-clear']);
+  const inFlight = world.lastMsgOfType('extract');
+  world.reply({
+    id: inFlight.id,
+    type: 'extract-result',
+    files: [
+      { path: 'a.txt', data: new Uint8Array([1]) },
+      { path: 'b.txt', data: new Uint8Array([2]) }
+    ]
+  });
+  await tick(80);
+  check('(8e) Clear mid-flight: ZERO downloads added and no status set after the late reply',
+    world.byId['downloads'].children.length === 0 && world.status() === '' && !world.isError(),
+    'rows=' + world.byId['downloads'].children.length + ' status=' + JSON.stringify(world.status()));
+
+  // Folder flow. Fresh archive NAME on purpose: openArchiveViaInput waits for
+  // "a list message with this name", which the first flow's message already
+  // satisfies — reusing 'test.7z' would grab the stale request id.
+  listMsg = await openArchiveViaInput(world, 'test2.7z', enc.encode('arc'), 'application/x-7z-compressed');
+  world.reply({ id: listMsg.id, type: 'list-result', entries: SEL_ENTRIES });
+  check('(8e) second archive listed before the selected-to-folder extract',
+    await waitFor(() => world.status() === '"test2.7z": 3 entries listed'),
+    'status=' + JSON.stringify(world.status()));
+  selToggle(world, selRowBox(world, 2), true); // a.txt
+  world.click(world.byId['btn-extract-selected-folder']);
+  const gotExtract2 = await waitFor(() => world.msgOfType('extract').length >= 2);
+  check('(8e) selected-to-folder request is in flight before Clear', gotExtract2);
+  world.click(world.byId['btn-clear']);
+  const inFlight2 = world.lastMsgOfType('extract');
+  world.reply({
+    id: inFlight2.id,
+    type: 'extract-result',
+    files: [{ path: 'a.txt', data: new Uint8Array([1]) }]
+  });
+  await tick(80);
+  check('(8e) Clear mid-flight: ZERO directory writes, zero downloads, no status, no console errors',
+    fakeDir.log.order.length === 0 && world.byId['downloads'].children.length === 0 &&
+    world.status() === '' && !world.isError() && world.errors.length === 0,
+    JSON.stringify({ order: fakeDir.log.order, status: world.status(), errors: world.errors }));
 }
 
 /* ----------------------------------------------------------------- report */

@@ -142,14 +142,17 @@
       touch-action: manipulation;
       transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
     }
-    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    /* Hover feedback is for actionable buttons only: a disabled .btn must
+       not light up in the accent color under the cursor. */
+    .btn:not(:disabled):hover { border-color: var(--accent); color: var(--accent); }
     .btn:active { transform: translateY(1px); }
+    .btn:disabled { opacity: 0.5; cursor: default; }
     .btn.primary {
       background: var(--accent);
       border-color: var(--accent);
       color: var(--accent-fg);
     }
-    .btn.primary:hover {
+    .btn.primary:not(:disabled):hover {
       background: var(--accent-strong);
       border-color: var(--accent-strong);
       color: var(--accent-fg);
@@ -268,7 +271,7 @@
     }
     table {
       width: 100%;
-      min-width: 36rem;
+      min-width: 38rem;
       border-collapse: collapse;
       font-size: 0.88rem;
     }
@@ -292,9 +295,18 @@
     }
     tbody tr:last-child td { border-bottom: none; }
     tbody tr:hover td { background: var(--bg-soft); }
-    tbody tr.folder td:first-child { font-weight: 600; }
-    tbody tr.folder td:first-child::before { content: '🗀 '; }
-    th:nth-child(2), td:nth-child(2) { text-align: right; font-variant-numeric: tabular-nums; }
+    tbody tr.folder td:nth-child(2) { font-weight: 600; }
+    tbody tr.folder td:nth-child(2)::before { content: '🗀 '; }
+    th:nth-child(3), td:nth-child(3) { text-align: right; font-variant-numeric: tabular-nums; }
+    .col-select { width: 2.2rem; min-width: 2.2rem; text-align: left; }
+    .col-select input[type="checkbox"] {
+      width: 1.05rem;
+      height: 1.05rem;
+      margin: 0;
+      vertical-align: middle;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
 
     /* ---------- compress panel ---------- */
     #compress-list {
@@ -465,7 +477,9 @@
         <h2>Archive: <span id="archive-name"></span></h2>
         <div class="panel-actions">
           <button id="btn-extract-all" type="button" class="btn primary">Extract all</button>
+          <button id="btn-extract-selected" type="button" class="btn" aria-label="Extract only the checked entries as downloads" disabled>Extract selected</button>
           <button id="btn-extract-folder" type="button" class="btn" aria-label="Extract all entries into a folder you choose" hidden>Extract to folder…</button>
+          <button id="btn-extract-selected-folder" type="button" class="btn" aria-label="Extract only the checked entries into a folder you choose" hidden disabled>Selected to folder…</button>
           <button id="btn-test-archive" type="button" class="btn">Test archive</button>
         </div>
       </div>
@@ -473,6 +487,7 @@
         <table>
           <thead>
             <tr>
+              <th class="col-select"><input type="checkbox" id="entry-select-all" aria-label="Select all entries"></th>
               <th scope="col">Name</th>
               <th scope="col">Size</th>
               <th scope="col">Modified</th>

@@ -15,6 +15,12 @@
  *   (e) two sequential jobs back-to-back proving /job<id> FS cleanup
  *       (probe Module.FS.readdir('/') — no stale job dirs, no stale-path errors)
  *   (f) extract of an archive containing directory entries
+ *   (g) selective-extraction 'paths' abuse: malformed payloads (non-array,
+ *       non-string element, empty-string element) -> exact pinned error and
+ *       the worker keeps serving; the 8192 cap (8193 rejected pre-dedup, 8192
+ *       accepted and de-duplicated); backslash spellings normalize to the real
+ *       entry; '..' traversal payloads return zero files, never escape the
+ *       job out dir, and leave MEMFS clean
  *
  * Run: node tests/worker-adversarial.mjs   (from the repo root; any cwd works)
  * Prints "SKIPPED (wasm not built)" and exits 0 when <repo>/wasm is missing.
@@ -664,6 +670,164 @@ function listedDirs(entry, meta) {
     console.log(`      KNOWN DEFECT CONFIRMED: ${String(e && e.message ? e.message : e)}`);
   }
 }
+
+// (g) selective extraction: malformed 'paths' payloads, cap, traversal --------
+
+let gArchiveBytes = null;
+const gName = 'paths-fixture.7z';
+const gRoot = enc.encode('g-root payload\n'.repeat(20));
+const gInner = enc.encode('g-inner payload ✓\n'.repeat(20));
+
+await runScenario('(g0) build a 2-file fixture archive for the paths scenarios', async () => {
+  const id = nextId();
+  const res = await sendAndWait(
+    {
+      id,
+      type: 'compress',
+      files: [
+        { path: 'root.txt', data: bufOf(gRoot) },
+        { path: 'sub/inner.txt', data: bufOf(gInner) },
+      ],
+      archiveName: gName,
+      format: '7z',
+      level: '1',
+    },
+    ['compress-result', 'error']
+  );
+  errIfError(res, '(g0) fixture compress');
+  gArchiveBytes = res.response.archive.data;
+  assert(gArchiveBytes && gArchiveBytes.byteLength > 32, '(g0) fixture archive non-trivial');
+  assertJobDirCleaned(id);
+});
+
+await runScenario('(g1) malformed paths payloads -> exact error, worker keeps serving', async () => {
+  const bad = [
+    ['paths is a string', 'root.txt'],
+    ['paths is an object', { 0: 'root.txt', length: 1 }],
+    ['paths is a number', 42],
+    ['paths element is a number', ['root.txt', 7]],
+    ['paths element is null', [null]],
+    ['paths element is an object', [{ path: 'root.txt' }]],
+    ['paths contains an empty string', ['root.txt', '']],
+    ['paths is an empty-string-only array', ['']],
+  ];
+  for (const [label, paths] of bad) {
+    const id = nextId();
+    const res = await sendAndWait(
+      { id, type: 'extract', archive: { name: gName, data: gArchiveBytes }, paths },
+      ['extract-result', 'error']
+    );
+    assert(res.response.type === 'error', `(g1) ${label}: expected {type:'error'}, got '${res.response.type}'`);
+    assert(
+      res.response.message === 'extract: paths must be an array of non-empty strings',
+      `(g1) ${label}: exact pinned message (got '${res.response.message}')`
+    );
+    assert(res.response.id === id, `(g1) ${label}: error carries the request id`);
+    assertJobDirCleaned(id);
+
+    // The worker must keep serving valid jobs after every rejection.
+    const okId = nextId();
+    const okRes = await sendAndWait(
+      { id: okId, type: 'extract', archive: { name: gName, data: gArchiveBytes }, paths: ['root.txt'] },
+      ['extract-result', 'error']
+    );
+    errIfError(okRes, `(g1) valid extract right after: ${label}`);
+    assert(okRes.response.files.length === 1 && okRes.response.files[0].path === 'root.txt',
+      `(g1) worker still healthy after: ${label}`);
+    assert(asBuffer(okRes.response.files[0].data).equals(Buffer.from(gRoot)),
+      `(g1) root.txt still byte-identical after: ${label}`);
+    assertJobDirCleaned(okId);
+  }
+  assertRootHasNoJobDirs('after (g1) malformed-paths loop');
+});
+
+await runScenario('(g2) paths cap: 8193 rejected with the pinned message, 8192 accepted', async () => {
+  const tooMany = new Array(8193).fill('root.txt'); // cap applies to the RAW length, pre-dedup
+  const id = nextId();
+  const res = await sendAndWait(
+    { id, type: 'extract', archive: { name: gName, data: gArchiveBytes }, paths: tooMany },
+    ['extract-result', 'error']
+  );
+  assert(res.response.type === 'error', `(g2) 8193 paths: expected {type:'error'}, got '${res.response.type}'`);
+  assert(
+    res.response.message === 'extract: too many selected paths',
+    `(g2) exact pinned cap message (got '${res.response.message}')`
+  );
+  assertJobDirCleaned(id);
+
+  const atCap = new Array(8192).fill('root.txt'); // duplicates de-dup to one first-occurrence entry
+  const okId = nextId();
+  const okRes = await sendAndWait(
+    { id: okId, type: 'extract', archive: { name: gName, data: gArchiveBytes }, paths: atCap },
+    ['extract-result', 'error']
+  );
+  errIfError(okRes, '(g2) 8192-path extract');
+  assert(okRes.response.files.length === 1 && okRes.response.files[0].path === 'root.txt',
+    `(g2) 8192 duplicates de-duplicated to exactly one root.txt (got ${okRes.response.files.length})`);
+  assert(asBuffer(okRes.response.files[0].data).equals(Buffer.from(gRoot)), '(g2) root.txt byte-identical at the cap');
+  assertJobDirCleaned(okId);
+  assertRootHasNoJobDirs('after (g2) cap scenarios');
+});
+
+await runScenario('(g3) backslash spellings match; ".." traversal extracts nothing and escapes nothing', async () => {
+  // Backslash path: post-filter normalizes '\' -> '/', so this returns the
+  // real file with its canonical forward-slash path.
+  const bsId = nextId();
+  const bsRes = await sendAndWait(
+    { id: bsId, type: 'extract', archive: { name: gName, data: gArchiveBytes }, paths: ['sub\\inner.txt'] },
+    ['extract-result', 'error']
+  );
+  errIfError(bsRes, '(g3) backslash-path extract');
+  assert(
+    bsRes.response.files.length === 1 && bsRes.response.files[0].path === 'sub/inner.txt',
+    `(g3) backslash path returned exactly sub/inner.txt (got ${JSON.stringify(bsRes.response.files.map((f) => f.path))})`
+  );
+  assert(asBuffer(bsRes.response.files[0].data).equals(Buffer.from(gInner)), '(g3) sub/inner.txt byte-identical');
+  assertJobDirCleaned(bsId);
+
+  // Traversal payloads: post-filter + MEMFS containment mean NONE of these may
+  // return files or error — and nothing outside the job out dir may appear.
+  const evil = [
+    ['../evil.txt'],
+    ['../../etc/passwd'],
+    ['sub/../../escape.bin'],
+    ['..'],
+    ['../evil.txt', 'root.txt'], // mixed with a valid path: only the valid one comes back
+  ];
+  for (const paths of evil) {
+    const id = nextId();
+    const res = await sendAndWait(
+      { id, type: 'extract', archive: { name: gName, data: gArchiveBytes }, paths },
+      ['extract-result', 'error']
+    );
+    assert(res.response.type === 'extract-result',
+      `(g3) ${JSON.stringify(paths)}: expected extract-result, got '${res.response.type}' (${res.response.message})`);
+    const returned = res.response.files.map((f) => f.path);
+    const allowed = ['root.txt', 'sub/inner.txt'];
+    assert(returned.every((p) => allowed.includes(p)),
+      `(g3) ${JSON.stringify(paths)}: nothing outside the archive listing returned (got ${JSON.stringify(returned)})`);
+    if (paths.includes('root.txt')) {
+      assert(returned.length === 1 && returned[0] === 'root.txt',
+        `(g3) mixed payload returned ONLY the valid path (got ${JSON.stringify(returned)})`);
+    } else {
+      assert(returned.length === 0,
+        `(g3) ${JSON.stringify(paths)}: traversal payload returned zero files (got ${JSON.stringify(returned)})`);
+    }
+    assertJobDirCleaned(id);
+  }
+  assertRootHasNoJobDirs('after (g3) traversal scenarios');
+
+  // Full extraction still works after all of the above.
+  const okId = nextId();
+  const okRes = await sendAndWait(
+    { id: okId, type: 'extract', archive: { name: gName, data: gArchiveBytes } },
+    ['extract-result', 'error']
+  );
+  errIfError(okRes, '(g3) closing full extract');
+  assert(okRes.response.files.length === 2, `(g3) closing full extract returned both files (got ${okRes.response.files.length})`);
+  assertJobDirCleaned(okId);
+  assertRootHasNoJobDirs('after (g3) closing full extract');
+});
 
 // ---------------------------------------------------------------- summary ---
 

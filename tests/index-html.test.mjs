@@ -10,11 +10,14 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const FILE = ROOT + '/index.html';
 const html = readFileSync(FILE, 'utf8');
 
-// The 22 contract ids: the original 20 plus the two feature-detected native
-// picker buttons (Open archive… / Extract to folder…).
+// The 25 contract ids: the original 20, the two feature-detected native
+// picker buttons (Open archive… / Extract to folder…) and the three
+// selective-extraction additions (select-all checkbox + the two
+// "selected entries" buttons).
 const EXPECTED_IDS = [
   'dropzone', 'file-input', 'btn-open-archive', 'status-line', 'progress-output',
-  'archive-panel', 'archive-name', 'entries-body', 'btn-extract-all', 'btn-extract-folder', 'btn-test-archive',
+  'archive-panel', 'archive-name', 'entry-select-all', 'entries-body',
+  'btn-extract-all', 'btn-extract-selected', 'btn-extract-folder', 'btn-extract-selected-folder', 'btn-test-archive',
   'compress-panel', 'compress-list', 'format-select', 'level-select', 'password-input', 'btn-compress',
   'downloads', 'install-btn', 'net-status', 'build-version', 'btn-clear',
 ];
@@ -123,9 +126,9 @@ check('dark + light themes via prefers-color-scheme', () => {
 });
 
 // ---- DOM ID contract -------------------------------------------------------
-check('all 22 contract ids defined exactly once, no extra ids', () => {
+check('all 25 contract ids defined exactly once, no extra ids', () => {
   const found = [...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]);
-  assert.equal(EXPECTED_IDS.length, 22, 'contract id list must hold 22 ids');
+  assert.equal(EXPECTED_IDS.length, 25, 'contract id list must hold 25 ids');
   for (const id of EXPECTED_IDS) {
     assert.equal(found.filter(x => x === id).length, 1, `id "${id}" must appear exactly once`);
   }
@@ -184,6 +187,54 @@ check('#btn-extract-folder: hidden .btn between #btn-extract-all and #btn-test-a
   assert.match(btn[0], /aria-label="[^"]{10,}"/);
 });
 
+check('.panel-actions order: all < selected < folder < selected-folder < test', () => {
+  const panel = rangeOfTag('section', 'archive-panel');
+  assert.ok(panel, 'archive-panel section missing');
+  const actions = /<div class="panel-actions">([\s\S]*?)<\/div>/.exec(panel.inner);
+  assert.ok(actions, '.panel-actions missing inside archive-panel');
+  const ids = [...actions[1].matchAll(/<button id="([^"]+)"/g)].map(m => m[1]);
+  assert.deepEqual(ids, [
+    'btn-extract-all', 'btn-extract-selected', 'btn-extract-folder',
+    'btn-extract-selected-folder', 'btn-test-archive',
+  ]);
+});
+
+check('#btn-extract-selected: visible .btn, type=button, aria-label, ships disabled', () => {
+  const btn = tagWithId('button', 'btn-extract-selected');
+  assert.ok(btn, 'btn-extract-selected button missing');
+  assert.match(btn[0], /type="button"/);
+  assert.match(btn[0], /class="btn"/);
+  assert.match(btn[0], /aria-label="[^"]{10,}"/);
+  assert.match(btn[0], /\bdisabled\b/, 'must ship disabled — app.js enables it once a selection exists');
+  assert.ok(!/\bhidden\b/.test(btn[0]), 'btn-extract-selected must NOT ship hidden (it is the download path, always available)');
+  // Its label text is pinned verbatim by the contract.
+  const m = /<button[^>]*\bid="btn-extract-selected"[^>]*>([^<]*)<\/button>/.exec(html);
+  assert.ok(m, 'btn-extract-selected has no simple text body');
+  assert.equal(m[1], 'Extract selected');
+});
+
+check('#btn-extract-selected-folder: hidden .btn, type=button, aria-label, ships disabled', () => {
+  const btn = tagWithId('button', 'btn-extract-selected-folder');
+  assert.ok(btn, 'btn-extract-selected-folder button missing');
+  assert.match(btn[0], /type="button"/);
+  assert.match(btn[0], /class="btn"/);
+  assert.match(btn[0], /aria-label="[^"]{10,}"/);
+  assert.match(btn[0], /\bhidden\b/, 'must ship hidden — app.js unhides it only when showDirectoryPicker exists');
+  assert.match(btn[0], /\bdisabled\b/, 'must ship disabled — app.js enables it once a selection exists');
+  const m = /<button[^>]*\bid="btn-extract-selected-folder"[^>]*>([^<]*)<\/button>/.exec(html);
+  assert.ok(m, 'btn-extract-selected-folder has no simple text body');
+  assert.equal(m[1], 'Selected to folder…');
+});
+
+check('#entry-select-all is a checkbox input inside a .col-select th', () => {
+  const input = tagWithId('input', 'entry-select-all');
+  assert.ok(input, 'entry-select-all input missing');
+  assert.match(input[0], /type="checkbox"/);
+  assert.match(input[0], /aria-label="[^"]{5,}"/);
+  const th = /<th class="col-select">\s*<input[^>]*\bid="entry-select-all"[^>]*>\s*<\/th>/.exec(html);
+  assert.ok(th, 'entry-select-all must be wrapped in a th.col-select');
+});
+
 check('CSS: .dz-actions + .download-row/.btn-save-as rules live in the single inline <style> block', () => {
   const style = /<style>([\s\S]*?)<\/style>/.exec(html);
   assert.ok(style, 'no <style> block');
@@ -192,6 +243,21 @@ check('CSS: .dz-actions + .download-row/.btn-save-as rules live in the single in
   assert.match(style[1], /\.download-row\s+a\s*\{[^}]*flex:\s*1 1 auto/);
   assert.match(style[1], /\.btn-save-as\s*\{/);
   assert.ok(!/<link[^>]+stylesheet/i.test(html), 'external stylesheet link found');
+});
+
+check('CSS: selection column — right-align moved to nth-child(3), .col-select + checkbox accent, .btn:disabled', () => {
+  const style = /<style>([\s\S]*?)<\/style>/.exec(html);
+  assert.ok(style, 'no <style> block');
+  // The checkbox column inserted first shifted the right-aligned Size column
+  // from nth-child(2) to nth-child(3).
+  assert.match(style[1], /th:nth-child\(3\),\s*td:nth-child\(3\)\s*\{[^}]*text-align:\s*right/);
+  assert.ok(!/nth-child\(2\)[^}]*text-align:\s*right/.test(style[1]), 'right-align must no longer target nth-child(2)');
+  // Narrow, left-aligned select column; row checkboxes sized + accent-tinted.
+  assert.match(style[1], /\.col-select\s*\{[^}]*width:\s*2\.2rem/);
+  assert.match(style[1], /\.col-select\s*\{[^}]*text-align:\s*left/);
+  assert.match(style[1], /\.col-select\s+input\[type="checkbox"\]\s*\{[^}]*accent-color:\s*var\(--accent\)/);
+  // Disabled buttons dimmed with the default cursor.
+  assert.match(style[1], /\.btn:disabled\s*\{[^}]*opacity:[^}]*cursor:\s*default/);
 });
 
 check('#status-line present; #progress-output is a <pre>', () => {
@@ -203,12 +269,25 @@ check('#archive-panel is a hidden <section> containing name/table/buttons', () =
   const panel = rangeOfTag('section', 'archive-panel');
   assert.ok(panel, 'archive-panel section missing');
   assert.match(panel.open, /\bhidden\b/);
-  for (const id of ['archive-name', 'entries-body', 'btn-extract-all', 'btn-extract-folder', 'btn-test-archive']) {
+  for (const id of ['archive-name', 'entry-select-all', 'entries-body', 'btn-extract-all', 'btn-extract-selected', 'btn-extract-folder', 'btn-extract-selected-folder', 'btn-test-archive']) {
     assert.ok(panel.inner.includes(`id="${id}"`), `${id} not inside archive-panel`);
   }
   assert.ok(panel.inner.includes('<table'), 'no table inside archive-panel');
   assert.ok(tagWithId('tbody', 'entries-body'), 'entries-body must be a <tbody>');
   assert.ok(panel.inner.indexOf('<thead') < panel.inner.indexOf('<tbody'), 'thead must precede tbody');
+  // The FIRST thead column is the select-all checkbox column; the four TEXT
+  // headers keep their pinned labels and order behind it.
+  const thead = /<thead>([\s\S]*?)<\/thead>/.exec(panel.inner);
+  assert.ok(thead, 'no <thead> inside archive-panel');
+  assert.match(
+    thead[1],
+    /<th class="col-select"><input type="checkbox" id="entry-select-all" aria-label="Select all entries"><\/th>/,
+    'first header cell must be the select-all checkbox column'
+  );
+  assert.ok(
+    thead[1].indexOf('id="entry-select-all"') < thead[1].indexOf('>Name<'),
+    'the checkbox column must precede the Name column'
+  );
   const ths = [...panel.inner.matchAll(/<th[^>]*>([^<]*)<\/th>/g)].map(m => m[1].trim());
   assert.deepEqual(ths, ['Name', 'Size', 'Modified', 'Method']);
   assert.ok(tagWithId('button', 'btn-extract-all') && tagWithId('button', 'btn-extract-folder') && tagWithId('button', 'btn-test-archive'));
@@ -266,7 +345,7 @@ check('#btn-clear is a button', () => {
 });
 
 check('all buttons have type="button"', () => {
-  for (const id of ['install-btn', 'btn-clear', 'btn-extract-all', 'btn-extract-folder', 'btn-open-archive', 'btn-test-archive', 'btn-compress']) {
+  for (const id of ['install-btn', 'btn-clear', 'btn-extract-all', 'btn-extract-selected', 'btn-extract-folder', 'btn-extract-selected-folder', 'btn-open-archive', 'btn-test-archive', 'btn-compress']) {
     const tag = tagWithId('button', id);
     assert.ok(tag, `${id} missing`);
     assert.match(tag[0], /type="button"/, `${id} lacks type="button"`);

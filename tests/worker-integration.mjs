@@ -6,7 +6,10 @@
  * contract (self.onmessage / self.postMessage / importScripts / self.location /
  * fetch / console), loads worker.js into it and drives full jobs:
  *   init -> ready; compress (7z, level 5, nested path); list; extract
- *   roundtrip; test; password-protected compress with -mhe=on (correct and
+ *   roundtrip; test; SELECTIVE extraction via the optional 'paths' field
+ *   (single file, directory subtree, multi-file, literal wildcard name,
+ *   empty/omitted/null paths = full extraction, duplicates, nonexistent);
+ *   password-protected compress with -mhe=on (correct and
  *   WRONG password); plus zip roundtrip, corrupted-archive recovery,
  *   back-to-back queueing and per-job MEMFS hygiene.
  *
@@ -304,6 +307,182 @@ await runScenario('test -> ok:true', async () => {
   assert(res.response.ok === true, 'ok === true');
   assert(typeof res.response.raw === 'string' && res.response.raw.length > 0, 'raw tail included');
   assertJobDirCleaned(id);
+});
+
+// ------------------------------------------------- selective extraction ---
+//
+// Fixture for the optional 'paths' extract field. Note: '-dash.txt' cannot be
+// part of this fixture — the compress protocol rejects paths starting with
+// '-' ('compress: paths starting with "-" are not supported'), so it is NOT
+// trivially addable; leading-dash safety is covered by the '--' terminator in
+// the worker's extract argv (asserted structurally) and the adversarial
+// suite. The literal 'star*.txt' IS compressible and proves a wildcard-looking
+// name extracts as itself.
+
+const contentC = (() => {
+  // Deterministic pseudo-random binary payload for sub/deep/x.bin.
+  const out = new Uint8Array(4096);
+  let seed = 0x2f6e2b1;
+  for (let i = 0; i < out.length; i++) {
+    seed = (seed * 1103515245 + 12345) >>> 0;
+    out[i] = (seed >>> 16) & 0xff;
+  }
+  return out;
+})();
+const contentD = enc.encode('spaced name payload — ünicode ✓\n');
+const contentE = enc.encode('STAR payload, literally named with a wildcard character\n');
+
+const SEL_FIXTURE = [
+  { path: 'root.txt', data: contentA },
+  { path: 'sub/inner.txt', data: contentB },
+  { path: 'sub/deep/x.bin', data: contentC },
+  { path: 'spaced name.txt', data: contentD },
+  { path: 'star*.txt', data: contentE },
+];
+const selArchiveName = 'selective.7z';
+let selArchiveBytes = null;
+
+// Send an extract against the selective fixture. `paths` is only attached when
+// present in opts, so "omitted paths" is genuinely absent (not undefined-valued
+// in the assertion sense). Returns a path -> Buffer map of the reply files.
+async function extractSelected(id, opts) {
+  const msg = { id, type: 'extract', archive: { name: selArchiveName, data: selArchiveBytes } };
+  if ('paths' in opts) msg.paths = opts.paths;
+  if (opts.password !== undefined) msg.password = opts.password;
+  const res = await sendAndWait(msg, ['extract-result', 'error']);
+  if (res.response.type === 'error') throw new Error('worker error: ' + res.response.message);
+  const files = res.response.files;
+  assert(Array.isArray(files), 'extract-result carries a files array');
+  // The worker posts WITHOUT a transfer list when files is empty, so transfer
+  // assertions are only valid for non-empty results.
+  if (files.length > 0) {
+    assert(
+      Array.isArray(res.transfer) && res.transfer.length === files.length,
+      `all ${files.length} ArrayBuffers sent in the transfer list`
+    );
+  }
+  const byPath = new Map();
+  for (const f of files) {
+    assert(!byPath.has(f.path), `duplicate returned path '${f.path}'`);
+    byPath.set(f.path, asBuffer(f.data));
+  }
+  return byPath;
+}
+
+// `expected` must be SORTED; also byte-checks every returned fixture file and
+// the job-dir hygiene for the job id.
+function assertExactSelection(byPath, expected, id) {
+  const got = [...byPath.keys()].sort();
+  assert(
+    got.length === expected.length && got.every((p, i) => p === expected[i]),
+    `returned exactly [${expected.join(', ')}] (got [${got.join(', ')}])`
+  );
+  for (const fx of SEL_FIXTURE) {
+    if (byPath.has(fx.path)) {
+      assert(byPath.get(fx.path).equals(Buffer.from(fx.data)), `'${fx.path}' byte-identical`);
+    }
+  }
+  assertJobDirCleaned(id);
+}
+
+const ALL_SEL_PATHS = SEL_FIXTURE.map((f) => f.path).sort();
+
+await runScenario('selective fixture: compress + list 5 files (nested, deep, spaced, wildcard-name)', async () => {
+  const id = nextId();
+  const res = await sendAndWait(
+    {
+      id,
+      type: 'compress',
+      files: SEL_FIXTURE.map((f) => ({ path: f.path, data: bufOf(f.data) })),
+      archiveName: selArchiveName,
+      format: '7z',
+      level: '5',
+    },
+    ['compress-result', 'error']
+  );
+  if (res.response.type === 'error') throw new Error('worker error: ' + res.response.message);
+  selArchiveBytes = res.response.archive.data;
+  assert(selArchiveBytes && selArchiveBytes.byteLength > 32, 'fixture archive has non-trivial size');
+  assertJobDirCleaned(id);
+
+  const lid = nextId();
+  const lres = await sendAndWait(
+    { id: lid, type: 'list', archive: { name: selArchiveName, data: selArchiveBytes } },
+    ['list-result', 'error']
+  );
+  if (lres.response.type === 'error') throw new Error('worker error: ' + lres.response.message);
+  const listed = [...lres.response.entries.filter((e) => !e.isFolder).map((e) => e.path)].sort();
+  assert(
+    listed.length === ALL_SEL_PATHS.length && listed.every((p, i) => p === ALL_SEL_PATHS[i]),
+    `fixture lists exactly [${ALL_SEL_PATHS.join(', ')}] (got [${listed.join(', ')}])`
+  );
+  assertJobDirCleaned(lid);
+});
+
+await runScenario("extract paths=['sub/inner.txt'] -> exactly that one file, byte-identical", async () => {
+  const id = nextId();
+  const byPath = await extractSelected(id, { paths: ['sub/inner.txt'] });
+  assertExactSelection(byPath, ['sub/inner.txt'], id);
+});
+
+await runScenario("extract paths=['sub'] -> the whole subtree (inner.txt + deep/x.bin)", async () => {
+  const id = nextId();
+  const byPath = await extractSelected(id, { paths: ['sub'] });
+  assertExactSelection(byPath, ['sub/deep/x.bin', 'sub/inner.txt'], id);
+});
+
+await runScenario("extract paths=['root.txt','spaced name.txt'] -> exactly those two files", async () => {
+  const id = nextId();
+  const byPath = await extractSelected(id, { paths: ['root.txt', 'spaced name.txt'] });
+  assertExactSelection(byPath, ['root.txt', 'spaced name.txt'], id);
+});
+
+await runScenario("extract paths=['star*.txt'] -> the literal wildcard-named file only", async () => {
+  // 'star*.txt' contains '*', so it is not filter-safe: the worker must run
+  // FULL mode (or fall back to it) and post-filter. The contract pins the
+  // RESULT, not the mode: exactly the file literally named 'star*.txt',
+  // byte-identical — never a 7z wildcard over-match.
+  const id = nextId();
+  const byPath = await extractSelected(id, { paths: ['star*.txt'] });
+  assertExactSelection(byPath, ['star*.txt'], id);
+});
+
+await runScenario('extract paths=[] / omitted / null -> full extraction, all byte-identical', async () => {
+  const idEmpty = nextId();
+  const byEmpty = await extractSelected(idEmpty, { paths: [] });
+  assertExactSelection(byEmpty, ALL_SEL_PATHS, idEmpty);
+
+  const idOmit = nextId();
+  const byOmit = await extractSelected(idOmit, {});
+  assertExactSelection(byOmit, ALL_SEL_PATHS, idOmit);
+
+  const idNull = nextId();
+  const byNull = await extractSelected(idNull, { paths: null });
+  assertExactSelection(byNull, ALL_SEL_PATHS, idNull);
+
+  for (const fx of SEL_FIXTURE) {
+    assert(
+      byEmpty.get(fx.path).equals(byOmit.get(fx.path)) && byOmit.get(fx.path).equals(byNull.get(fx.path)),
+      `'${fx.path}' identical across paths=[] vs omitted vs null`
+    );
+  }
+});
+
+await runScenario('duplicate selected paths are de-duplicated (no duplicate files returned)', async () => {
+  const id = nextId();
+  const byPath = await extractSelected(id, { paths: ['root.txt', 'sub/inner.txt', 'root.txt', 'root.txt'] });
+  assertExactSelection(byPath, ['root.txt', 'sub/inner.txt'], id);
+});
+
+await runScenario('nonexistent selected path -> empty extract-result, worker keeps serving', async () => {
+  const id = nextId();
+  const byPath = await extractSelected(id, { paths: ['nope.txt'] });
+  assert(byPath.size === 0, `no files returned for a nonexistent path (got [${[...byPath.keys()]}])`);
+  assertJobDirCleaned(id);
+  // Health check: a valid selective job right after the empty one.
+  const id2 = nextId();
+  const byPath2 = await extractSelected(id2, { paths: ['root.txt'] });
+  assertExactSelection(byPath2, ['root.txt'], id2);
 });
 
 let secretBytes = null;

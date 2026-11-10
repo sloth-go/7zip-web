@@ -17,10 +17,12 @@ function t(name, fn) {
   catch (e) { console.log('FAIL - ' + name + '\n       ' + e.message); fail++; }
 }
 
-// The 22 contract ids: the original 20 plus the feature-detected native picker
-// buttons added for PWA file handling.
+// The 25 contract ids: the original 20, the feature-detected native picker
+// buttons added for PWA file handling, and the three selective-extraction
+// additions (select-all checkbox + the two "selected entries" buttons).
 const CONTRACT_IDS = ['dropzone','file-input','btn-open-archive','status-line','progress-output','archive-panel',
-  'archive-name','entries-body','btn-extract-all','btn-extract-folder','btn-test-archive','compress-panel',
+  'archive-name','entry-select-all','entries-body','btn-extract-all','btn-extract-selected','btn-extract-folder',
+  'btn-extract-selected-folder','btn-test-archive','compress-panel',
   'compress-list','format-select','level-select','password-input','btn-compress','downloads',
   'install-btn','net-status','build-version','btn-clear'];
 
@@ -34,6 +36,7 @@ for (const m of appjs.matchAll(/querySelector(?:All)?\(\s*['"]([^'"]+)['"]\s*\)/
 
 // 1. ID contract
 t('every contract id defined exactly once in index.html', () => {
+  assert.equal(CONTRACT_IDS.length, 25, 'contract id list must hold 25 ids');
   for (const id of CONTRACT_IDS) {
     assert.equal(htmlIds.filter(x => x === id).length, 1, 'id ' + id);
   }
@@ -104,9 +107,9 @@ t('no inline event handlers or javascript: URLs', () => {
 });
 
 // 5. structure requirements
-t('#entries-body is tbody inside a table with thead Name/Size/Modified/Method', () => {
-  const m = html.match(/<table>\s*<thead>\s*<tr>\s*<th[^>]*>([^<]+)<\/th>\s*<th[^>]*>([^<]+)<\/th>\s*<th[^>]*>([^<]+)<\/th>\s*<th[^>]*>([^<]+)<\/th>\s*<\/tr>\s*<\/thead>\s*<tbody id="entries-body"><\/tbody>\s*<\/table>/);
-  assert.ok(m, 'table structure mismatch');
+t('#entries-body is tbody inside a table whose thead leads with a select-all checkbox then Name/Size/Modified/Method', () => {
+  const m = html.match(/<table>\s*<thead>\s*<tr>\s*<th class="col-select"><input type="checkbox" id="entry-select-all"[^>]*><\/th>\s*<th[^>]*>([^<]+)<\/th>\s*<th[^>]*>([^<]+)<\/th>\s*<th[^>]*>([^<]+)<\/th>\s*<th[^>]*>([^<]+)<\/th>\s*<\/tr>\s*<\/thead>\s*<tbody id="entries-body"><\/tbody>\s*<\/table>/);
+  assert.ok(m, 'table structure mismatch (select-all th + 4 text th + tbody#entries-body)');
   assert.deepEqual([m[1], m[2], m[3], m[4]], ['Name','Size','Modified','Method']);
 });
 t('panels + install btn hidden initially', () => {
@@ -138,12 +141,16 @@ t('#password-input type=password; #net-status and #build-version are spans; buil
   assert.match(html, /<span id="net-status"/);
   assert.match(html, /<span id="build-version">local<\/span>/);
 });
-t('CSS supports classes app.js toggles: status error, net online/offline, hidden attr, dropzone dragover', () => {
+t('CSS supports classes app.js toggles: status error, net online/offline, hidden attr, dropzone dragover, disabled btn, select column', () => {
   assert.match(html, /#status-line\.error/);
   assert.match(html, /#net-status\.online/);
   assert.match(html, /#net-status\.offline/);
   assert.match(html, /\[hidden\]\s*\{\s*display:\s*none/);
   assert.match(html, /#dropzone\.dragover/);
+  assert.match(html, /\.btn:disabled/);
+  assert.match(html, /\.col-select\b/);
+  // the right-aligned Size column moved from nth-child(2) to nth-child(3)
+  assert.match(html, /th:nth-child\(3\),\s*td:nth-child\(3\)\s*\{[^}]*text-align:\s*right/);
 });
 
 // 5b. PWA file-handling additions (native pickers + downloads row)
@@ -157,11 +164,28 @@ t('both picker buttons ship hidden, type=button, class btn, with an aria-label',
     assert.match(m[0], /aria-label="[^"]{10,}"/, id + ' lacks a useful aria-label');
   }
 });
-t('only install-btn and the two picker buttons ship hidden (nothing else got hidden)', () => {
+t('both selection buttons ship type=button + class btn + aria-label + disabled; only the folder one ships hidden', () => {
+  for (const id of ['btn-extract-selected', 'btn-extract-selected-folder']) {
+    const m = html.match(new RegExp('<button id="' + id + '"[^>]*>([^<]*)</button>'));
+    assert.ok(m, id + ' button missing');
+    assert.match(m[0], /type="button"/, id + ' lacks type="button"');
+    assert.match(m[0], /class="btn"/, id + ' must reuse the .btn conventions');
+    assert.match(m[0], /aria-label="[^"]{10,}"/, id + ' lacks a useful aria-label');
+    assert.match(m[0], /\bdisabled\b/, id + ' must ship disabled until a selection exists');
+  }
+  assert.ok(!/\bhidden\b/.test(html.match(/<button id="btn-extract-selected"[^>]*>/)[0]),
+    'btn-extract-selected must NOT ship hidden (download path, always available)');
+  assert.match(html.match(/<button id="btn-extract-selected-folder"[^>]*>/)[0], /\bhidden\b/,
+    'btn-extract-selected-folder must ship hidden (feature-detected at boot)');
+  // Pinned base labels (app.js appends " (N)" while a selection is active).
+  assert.equal(html.match(/<button id="btn-extract-selected"[^>]*>([^<]*)</)[1], 'Extract selected');
+  assert.equal(html.match(/<button id="btn-extract-selected-folder"[^>]*>([^<]*)</)[1], 'Selected to folder…');
+});
+t('only install-btn and the three feature-gated buttons ship hidden (nothing else got hidden)', () => {
   const hidden = [...html.matchAll(/<button\b[^>]*\bhidden\b[^>]*>/g)]
     .map(m => (m[0].match(/id="([^"]+)"/) || [])[1])
     .filter(Boolean);
-  assert.deepEqual(hidden.sort(), ['btn-extract-folder', 'btn-open-archive', 'install-btn']);
+  assert.deepEqual(hidden.sort(), ['btn-extract-folder', 'btn-extract-selected-folder', 'btn-open-archive', 'install-btn']);
 });
 t('.dz-actions row wraps #btn-open-archive and follows #file-input inside the dropzone section', () => {
   const sec = html.match(/<section aria-label="File drop zone">([\s\S]*?)<\/section>/);
@@ -173,11 +197,11 @@ t('.dz-actions row wraps #btn-open-archive and follows #file-input inside the dr
   assert.equal((row[1].match(/<button\b/g) || []).length, 1, '.dz-actions must hold exactly one button');
   assert.ok(row[1].includes('id="btn-open-archive"'), 'btn-open-archive not inside .dz-actions');
 });
-t('#btn-extract-folder sits between #btn-extract-all and #btn-test-archive inside .panel-actions', () => {
+t('.panel-actions button order is the 5-button contract order', () => {
   const panel = html.match(/<section id="archive-panel"[\s\S]*?<div class="panel-actions">([\s\S]*?)<\/div>/);
   assert.ok(panel, 'archive-panel .panel-actions missing');
   const ids = [...panel[1].matchAll(/<button id="([^"]+)"/g)].map(m => m[1]);
-  assert.deepEqual(ids, ['btn-extract-all', 'btn-extract-folder', 'btn-test-archive']);
+  assert.deepEqual(ids, ['btn-extract-all', 'btn-extract-selected', 'btn-extract-folder', 'btn-extract-selected-folder', 'btn-test-archive']);
 });
 t('CSS: .dz-actions, #downloads .download-row, .download-row a and .btn-save-as all styled inline', () => {
   assert.equal((html.match(/<style\b/g) || []).length, 1, 'still exactly one <style> block');

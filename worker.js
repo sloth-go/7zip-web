@@ -6,6 +6,11 @@
  *                   | {id,type:'compress',files:[{path,data}],archiveName,format,level,password?,encryptHeaders}
  *   worker -> main: {id,type:'ready'|'progress'|'list-result'|'extract-result'|'compress-result'|'test-result'|'error',...}
  *
+ * 'extract' additionally accepts an OPTIONAL paths:[string,...] field — entry
+ * paths exactly as the 'l -slt' listing returned them — restricting the job to
+ * that selection (FILTERED / FULL modes + post-filter, see runExtractJob).
+ * Absent, null or empty paths keep the unfiltered full-extraction behavior.
+ *
  * The engine is single-threaded: exactly one job runs at a time; messages that
  * arrive during init or while another job is running are queued in order.
  * Every job lives in /job<id>/in and /job<id>/out and is removed recursively
@@ -22,6 +27,16 @@
   var VALID_LEVELS = ['0', '1', '3', '5', '7', '9'];
   var RAW_TAIL_LINES = 60; // lines kept in 'raw' of test-result
   var ERROR_TAIL_LINES = 8; // output lines embedded in error messages
+  var MAX_SELECTED_PATHS = 8192; // hard cap on extract 'paths' entries
+  // Byte budget for the FILTERED-mode argv. callMain marshals every argv
+  // string onto the engine's FIXED-SIZE wasm stack (allocateUTF8OnStack,
+  // unchecked stackAlloc): past a few MB the stack pointer plows through
+  // engine memory, main() aborts and EVERY later callMain aborts too — the
+  // worker is permanently bricked until the page reloads. Measured on this
+  // build: ~3.8 MB of filters still ran, ~5.7 MB bricked the engine. The
+  // budget stays far below that; over-budget selections simply run FULL
+  // extraction + post-filter instead (identical results, only slower).
+  var MAX_FILTER_ARGV_BYTES = 512 * 1024;
 
   // ---------------------------------------------------------------- state ---
   var Module = null; // emscripten Module, set once init resolves
@@ -340,14 +355,234 @@
     });
   }
 
+  // ------------------------------------------------ selective extraction ---
+
+  // A selected path is filter-safe iff non-empty and free of wildcard
+  // metachars. Mirrors 7-Zip's own DoesNameContainWildcard (Wildcard.cpp),
+  // which flags exactly '*' and '?' — and there is NO escape for them, so an
+  // unsafe path must never reach the command line (it would over-match).
+  function isFilterSafePath(p) {
+    return typeof p === 'string' && p.length > 0 && p.indexOf('*') === -1 && p.indexOf('?') === -1;
+  }
+
+  // Comparison form of a selected path: backslashes normalized to '/'.
+  // Listing paths already use '/'; no trimming, no case folding (7-Zip
+  // filters are case-sensitive and names may legitimately start/end with
+  // spaces).
+  function selNorm(p) {
+    return String(p).replace(/\\/g, '/');
+  }
+
+  // UTF-8 byte length without allocating (surrogate pairs count as 4).
+  function utf8Length(s) {
+    var n = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c < 0x80) n += 1;
+      else if (c < 0x800) n += 2;
+      else if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length &&
+               s.charCodeAt(i + 1) >= 0xdc00 && s.charCodeAt(i + 1) < 0xe000) {
+        n += 4;
+        i++;
+      } else n += 3;
+    }
+    return n;
+  }
+
+  // Total argv bytes the FILTERED run would marshal onto the wasm stack
+  // (one NUL per filter; pointer slots are negligible against the strings).
+  function filterArgvBytes(paths) {
+    var total = 0;
+    for (var i = 0; i < paths.length; i++) total += utf8Length(paths[i]) + 1;
+    return total;
+  }
+
+  // Validate the OPTIONAL 'paths' field of an extract request: an array of
+  // non-empty strings (entry paths verbatim from the 'l -slt' listing),
+  // de-duplicated with first-occurrence order preserved. Absent/null/[] ->
+  // [] (full extraction, byte-identical to the unfiltered behavior).
+  // Violations throw, which withJob turns into a {type:'error'} reply.
+  function selectedExtractPaths(paths) {
+    if (paths === undefined || paths === null) return [];
+    if (!Array.isArray(paths)) {
+      throw new Error('extract: paths must be an array of non-empty strings');
+    }
+    if (paths.length > MAX_SELECTED_PATHS) {
+      throw new Error('extract: too many selected paths');
+    }
+    var out = [];
+    var seen = new Set();
+    for (var i = 0; i < paths.length; i++) {
+      var p = paths[i];
+      if (typeof p !== 'string' || p.length === 0) {
+        throw new Error('extract: paths must be an array of non-empty strings');
+      }
+      if (!seen.has(p)) {
+        seen.add(p);
+        out.push(p);
+      }
+    }
+    return out;
+  }
+
+  // 7zz extract argv. filters === null -> FULL extraction (no '--', no
+  // positional filters; 7z falls back to its universal wildcard). Otherwise
+  // '--' goes AFTER every switch (-o, -bd, -y, -p<pw>) and IMMEDIATELY
+  // BEFORE the filters: after '--' even '-o…' would be parsed as a positional
+  // filter (silently empty output), and a leading '-' or '@' path is fatal
+  // when parsed among the switches.
+  function extractArgs(arcPath, outDir, msg, filters) {
+    var args = ['x', arcPath, '-o' + outDir, '-bd', '-y'].concat(passwordArgs(msg));
+    return filters && filters.length ? args.concat(['--'], filters) : args;
+  }
+
+  // POST-FILTER (applied in BOTH modes whenever a selection exists): keep a
+  // found file only when one of its path forms equals a form of a requested
+  // path, or starts with requestedForm + '/' (a requested directory selects
+  // its whole subtree). Guarantees the exact selected set regardless of 7-Zip
+  // filter matching semantics.
+  //
+  // A path has up to four comparison forms because the listing and the
+  // extractor disagree about hostile names:
+  //   selNorm    — backslashes normalized (the contract's base form);
+  //   ctlNorm    — C0 controls and DEL replaced with '_', exactly how the
+  //                'l -slt' listing sanitizes them (an entry 'cr.txt\r' is
+  //                LISTED as 'cr.txt_' but EXTRACTS under its real name);
+  //   safeRelPath — leading '/' stripped and '..' segments popped, exactly
+  //                how the extractor reshapes stored names ('/root.txt' and
+  //                '../escape.txt' both extract to plain relative paths);
+  //   ctlNorm(safeRelPath(...)) — both transforms combined.
+  // Matching any form of the requested path against any form of the found
+  // path keeps those entries selectable without ever letting a form escape
+  // the output sandbox (safeRelPath forms cannot contain '..' or a leading
+  // '/'; they only ever match files the extractor already produced).
+  function ctlNorm(s) {
+    // eslint-disable-next-line no-control-regex
+    return s.replace(/[\x00-\x1f\x7f]/g, '_');
+  }
+
+  function addPathForm(forms, f) {
+    if (f.length > 0 && forms.indexOf(f) === -1) forms.push(f);
+  }
+
+  function pathForms(p) {
+    var s = selNorm(p);
+    var r = safeRelPath(s);
+    var forms = [];
+    addPathForm(forms, s);
+    addPathForm(forms, ctlNorm(s));
+    addPathForm(forms, r);
+    addPathForm(forms, ctlNorm(r));
+    return forms;
+  }
+
+  // Map every form of every requested path to the indices of the requests
+  // owning it. Built ONCE per job: the per-file match cost is then a hash
+  // lookup per (form, ancestor-prefix) pair instead of a linear scan over
+  // all selections — O(files x depth) instead of O(files x selections),
+  // which at the 8192-path cap used to stall the worker for tens of
+  // seconds of synchronous string concat + regex work.
+  function buildSelectionIndex(selected) {
+    var owners = new Map();
+    for (var i = 0; i < selected.length; i++) {
+      var forms = pathForms(selected[i]);
+      for (var j = 0; j < forms.length; j++) {
+        var arr = owners.get(forms[j]);
+        if (arr === undefined) {
+          arr = [];
+          owners.set(forms[j], arr);
+        }
+        arr.push(i);
+      }
+    }
+    return owners;
+  }
+
+  // Walk one form of a found path (the whole string, then each ancestor
+  // directory prefix) and mark every requested path it satisfies as
+  // covered. Returns true on at least one hit.
+  function markCoveredForm(formOwners, form, covered) {
+    var matched = false;
+    var end = form.length;
+    while (end > 0) {
+      var owners = formOwners.get(end === form.length ? form : form.slice(0, end));
+      if (owners !== undefined) {
+        matched = true;
+        for (var i = 0; i < owners.length; i++) covered[owners[i]] = true;
+      }
+      var slash = form.lastIndexOf('/', end - 1);
+      if (slash <= 0) break; // no further non-empty prefix
+      end = slash;
+    }
+    return matched;
+  }
+
+  function keepSelectedFiles(found, formOwners, covered) {
+    var out = [];
+    for (var i = 0; i < found.length; i++) {
+      var forms = pathForms(found[i].rel);
+      var keep = false;
+      for (var j = 0; j < forms.length; j++) {
+        if (markCoveredForm(formOwners, forms[j], covered)) keep = true;
+      }
+      if (keep) out.push(found[i]);
+    }
+    return out;
+  }
+
+  // COVERAGE check for FILTERED mode: rc=0 + 'Everything is Ok' are printed
+  // even when a filter matched NOTHING, so verify every requested path
+  // produced at least one post-filtered file (covered[] is filled in by
+  // keepSelectedFiles). A miss triggers one FULL re-run; a genuinely empty
+  // directory still yields zero files after the re-run and is NOT an error.
+  function selectionCovered(covered) {
+    for (var i = 0; i < covered.length; i++) {
+      if (!covered[i]) return false;
+    }
+    return true;
+  }
+
   function runExtractJob(msg) {
     return withJob(msg, function (id, jobDir, inDir, outDir, FS) {
+      var selected = selectedExtractPaths(msg.paths);
       var arcPath = stageArchive(FS, inDir, msg.archive);
-      var args = ['x', arcPath, '-o' + outDir, '-bd', '-y'].concat(passwordArgs(msg));
-      var r = run7z(args);
+      // FILTERED mode (one CLI-filtered invocation) only when EVERY requested
+      // path is filter-safe AND the filter argv fits the wasm-stack byte
+      // budget (an over-budget argv would overflow the engine's fixed-size
+      // stack and permanently brick callMain — see MAX_FILTER_ARGV_BYTES);
+      // otherwise FULL extraction. Either way the walked output is
+      // post-filtered to the exact selection; with no selection the behavior
+      // is byte-identical to the original unfiltered extract.
+      var filteredMode =
+        selected.length > 0 &&
+        selected.every(isFilterSafePath) &&
+        filterArgvBytes(selected) <= MAX_FILTER_ARGV_BYTES;
+      var formOwners = selected.length ? buildSelectionIndex(selected) : null;
+      var covered = [];
+      for (var ci = 0; ci < selected.length; ci++) covered.push(false);
+
+      var r = run7z(extractArgs(arcPath, outDir, msg, filteredMode ? selected : null));
       if (r.crashed || r.rc >= 2) throw jobFailure(r, 'Extracting archive');
       var found = [];
       walkOutDir(FS, outDir, '', found);
+
+      if (selected.length) {
+        found = keepSelectedFiles(found, formOwners, covered);
+        if (filteredMode && !selectionCovered(covered)) {
+          // COVERAGE FALLBACK: some requested path produced zero files under
+          // the CLI filter (filter-matching quirks: basename-only matching,
+          // separator or case mismatches) — re-run ONCE in FULL mode and
+          // apply the same post-filter.
+          removeTree(FS, outDir);
+          FS.mkdirTree(outDir);
+          var rFull = run7z(extractArgs(arcPath, outDir, msg, null));
+          if (rFull.crashed || rFull.rc >= 2) throw jobFailure(rFull, 'Extracting archive');
+          found = [];
+          walkOutDir(FS, outDir, '', found);
+          found = keepSelectedFiles(found, formOwners, covered);
+        }
+      }
+
       var files = [];
       var transfer = [];
       for (var i = 0; i < found.length; i++) {
